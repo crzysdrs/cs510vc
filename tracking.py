@@ -30,6 +30,8 @@ class Tracking:
             blockSize = 3
         )
 
+        self.cluster_criteria = (cv2.TERM_CRITERIA_EPS, 30, 0.1)
+
         self.cur_frame = None
         self.processFrame(frame_0)
     
@@ -56,8 +58,8 @@ class Tracking:
             potential_points = abs(last_points-refound_points).reshape(-1, 2).max(-1)
             within_range = abs(refound_points - last_points).reshape(-1,2).max(-1) < 1
             new_tracks = []
-            for tr, (x,y), range_flag in zip(self.tracks, found_points.reshape(-1,2),  within_range):
-                if not range_flag:
+            for tr, (x,y), range_ok in zip(self.tracks, found_points.reshape(-1,2), within_range):
+                if not range_ok:
                     continue
                 tr.append((x,y))
                 if len(tr) > self.track_len:
@@ -92,10 +94,20 @@ class Tracking:
  
     def debug(self):
         img = self.cur_frame.frame
-        cv2.polylines(img, [np.int32(tr) for tr in self.tracks], False, (0, 255, 0))
+        points = np.float32([tr[-1] for tr in self.tracks]).reshape(-1, 1, 2)
+        cluster_n = (len(points) / 2)** 1/2
+        ret, labels, centers = (cv2.kmeans(points, cluster_n, self.cluster_criteria, 10, 0))
+        colors = np.zeros((1, cluster_n, 3), np.uint8)
+        colors[0,:] = 255
+        colors[0,:,0] = np.arange(0, 180, 180.0/cluster_n)
+        colors = cv2.cvtColor(colors, cv2.COLOR_HSV2BGR)[0]
+
+        for (x,y), label in zip(points.reshape(-1,2), labels.ravel()):
+            cv2.circle(img, (x,y), 1, map(int, colors[label]), -1)
+            #cv2.polylines(img, [np.int32(tr) for tr in self.tracks], False, (0, 255, 0))
         cv2.putText(img, "Tracks %d" % len(self.tracks), (0,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0))
         cv2.imshow("cur frame", img)
-        cv2.waitKey(1)
+        cv2.waitKey(1000)
 
 imgs = glob.glob("dataset/Walking/img/*.jpg")
 imgs.sort()
