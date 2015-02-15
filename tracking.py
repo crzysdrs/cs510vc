@@ -3,6 +3,7 @@ import numpy as np
 import cv2
 import glob
 import sys
+from collections import defaultdict
 
 class FrameData:
     def __init__(self, frame):
@@ -12,6 +13,7 @@ class FrameData:
 
 class Tracking:
     def __init__(self, frame_0):
+        self.oldframes = []
         self.refresh_interval = 1
         self.tracks = []
         self.track_len = 10
@@ -25,19 +27,26 @@ class Tracking:
         
         self.feature_params = dict(
             maxCorners = 3000, 
-            qualityLevel = 0.5,
+            qualityLevel = 0.25,
             minDistance = 3,
             blockSize = 3
         )
 
         self.cluster_criteria = (cv2.TERM_CRITERIA_EPS, 30, 0.1)
-
+        self.fgmask = None
+        self.fgbg = cv2.BackgroundSubtractorMOG2()
         self.cur_frame = None
         self.processFrame(frame_0)
-    
+        self.flow = None
+
+    def seedMask(self, frame):
+        self.fgmask = self.fgbg.apply(FrameData(frame).gray, self.fgmask, 0.01)
+
     def processFrame(self, frame):
         self.prev_frame = self.cur_frame
         self.cur_frame = FrameData(frame);
+        self.oldframes.append(self.cur_frame)
+        self.fgmask = self.fgbg.apply(self.cur_frame.gray, self.fgmask, 0.01)
 
         if self.prev_frame and len(self.tracks) > 0:
             last_points = np.float32([tr[-1] for tr in self.tracks]).reshape(-1, 1, 2)
@@ -79,8 +88,8 @@ class Tracking:
             if prev == None or prev != (x, y):
                 new_tracks.append(tr)
                 prev = (x,y)
-        self.tracks = new_tracks
-            
+        self.tracks = new_tracks    
+        
     def nextFrame(self, frame):
         self.frame_index += 1
         self.processFrame(frame)
@@ -91,29 +100,30 @@ class Tracking:
         if self.frame_index % self.refresh_interval == 0:
             points = cv2.goodFeaturesToTrack(self.cur_frame.gray, **self.feature_params)
             self.tracks += [[(x,y)] for (x,y) in points.reshape(-1,2)]
- 
-    def debug(self):
-        img = self.cur_frame.frame
-        points = np.float32([tr[-1] for tr in self.tracks]).reshape(-1, 1, 2)
-        cluster_n = (len(points) / 2)** 1/2
-        ret, labels, centers = (cv2.kmeans(points, cluster_n, self.cluster_criteria, 10, 0))
-        colors = np.zeros((1, cluster_n, 3), np.uint8)
-        colors[0,:] = 255
-        colors[0,:,0] = np.arange(0, 180, 180.0/cluster_n)
-        colors = cv2.cvtColor(colors, cv2.COLOR_HSV2BGR)[0]
 
-        for (x,y), label in zip(points.reshape(-1,2), labels.ravel()):
-            cv2.circle(img, (x,y), 1, map(int, colors[label]), -1)
-            #cv2.polylines(img, [np.int32(tr) for tr in self.tracks], False, (0, 255, 0))
+    def debug(self):
+        img = self.cur_frame.frame.copy()
+        cv2.polylines(img, [np.int32(tr) for tr in self.tracks], False, (0, 255, 0))
         cv2.putText(img, "Tracks %d" % len(self.tracks), (0,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0))
+        mask = self.fgmask
+        mask = cv2.blur(mask, (10,10))
+        mask = cv2.dilate(mask,np.ones((5,5), np.uint8),iterations=3)
+        ret, mask = cv2.threshold(mask, 255//5,255,0)
+        mask = cv2.erode(mask, np.ones((5,5), np.uint8))
+        contours, hierarchy = cv2.findContours(mask.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)  
+        cv2.drawContours(img, contours, -1, (255,0,0), 3)
         cv2.imshow("cur frame", img)
-        cv2.waitKey(1000)
+        cv2.imshow('fgmask', mask)
+        cv2.waitKey(1)
 
 imgs = glob.glob("dataset/Walking/img/*.jpg")
 imgs.sort()
 
 t = Tracking(cv2.imread(imgs[0]))
-for imgname in imgs[1:]:
+for imgname in imgs[:50]:
+    t.seedMask(cv2.imread(imgname))
+
+for imgname in imgs[0:]:
     t.nextFrame(cv2.imread(imgname))
 
 cv2.destroyAllWindows()
