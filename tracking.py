@@ -205,7 +205,7 @@ if __name__ == '__main__':
         for imgname in imgs[0:]:
             t.nextFrame(cv2.imread(imgname))
     else:
-        cap = cv2.VideoCapture("/home/crzysdrs/qmul_junction.mp4")
+        cap = cv2.VideoCapture("annex/qmul_junction.mp4")
         ret = 1
         samples = 0
         while ret != 0:
