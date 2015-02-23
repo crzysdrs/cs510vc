@@ -41,6 +41,7 @@ class Tracking:
         self.oldframes = []
         self.refresh_interval = 1
         self.tracks = []
+        self.hotpoints = []
         self.track_len = 10
         self.frame_index = 0
         self.clusters = []
@@ -54,9 +55,9 @@ class Tracking:
         
         self.feature_params = dict(
             maxCorners = 3000, 
-            qualityLevel = 0.05,
-            minDistance = 2,
-            blockSize = 2
+            qualityLevel = 0.15,
+            minDistance = 3,
+            blockSize = 3
         )
 
         self.cluster_criteria = (cv2.TERM_CRITERIA_EPS, 30, 0.1)
@@ -68,10 +69,13 @@ class Tracking:
         self.centers = None
 
     def highlightMotion(self, img):
+        circle_radius = 4
+        motion_img = np.zeros_like(self.cur_frame.frame)
+        tracks = filter(lambda x: len(x) < 10, self.tracks)
         motion_tracks = filter(lambda x: len(x) >= 10, self.tracks)
-        motion_tracks = filter(lambda x: np.any(np.absolute(np.subtract(x[-1],x[0])) > 1), motion_tracks)
+        motion_tracks = filter(lambda x: np.any(np.absolute(np.subtract(x[-1],x[0])) > 2), motion_tracks)
         if len(motion_tracks) == 0:
-            return
+            return motion_img
         points = np.float32([tr[-1] for tr in motion_tracks]).reshape(-1, 2)
         velocity = np.float32([np.subtract(tr[-1],tr[-2]) for tr in motion_tracks]).reshape(-1,2) * 10 **3
         cluster_data = np.hstack((points, velocity))
@@ -84,9 +88,21 @@ class Tracking:
         hsv[...,2] = cv2.normalize(mag,None,0,255,cv2.NORM_MINMAX).reshape(ang.shape[0])
         rgb = cv2.cvtColor(hsv.reshape(ang.shape[0], -1, 3),cv2.COLOR_HSV2BGR)
         rgb = rgb.reshape(ang.shape[0], 3)
-        for (p, c) in zip(points, rgb):
-            cv2.circle(img, (p[0], p[1]), 3, (int(c[0]), int(c[1]), int(c[2])), -1)
-        
+        culledtracks = []
+        for (t, c) in zip(motion_tracks, rgb):
+            p = map(int, t[-1])
+            try:
+                target = motion_img[p[1], p[0]]            
+                if np.all(target == 0):
+                    cv2.circle(motion_img, (p[0], p[1]), circle_radius, map(int, c), -1)
+                    cv2.circle(img, (p[0], p[1]), circle_radius, map(int, c), -1)
+                    culledtracks.append(t)
+            except IndexError:
+                pass
+
+        self.tracks = tracks + culledtracks
+        return motion_img
+
     def motionTracking(self, motion_mask):
         MHI_DURATION = 4
         MAX_TIME_DELTA = 20
@@ -102,7 +118,7 @@ class Tracking:
         mg_mask, mg_orient = cv2.calcMotionGradient(motion_history, MAX_TIME_DELTA, MIN_TIME_DELTA, apertureSize=7 )
         seg_mask, seg_bounds = cv2.segmentMotion(motion_history, timestamp, MAX_TIME_DELTA)
         
-        visual_name = 'grad_orient'
+        visual_name = 'motion_hist'
         if visual_name == 'input':
             vis = self.cur_frame.frame.copy()
         elif visual_name == 'frame_diff':
@@ -130,38 +146,8 @@ class Tracking:
             angle = cv2.calcGlobalOrientation(orient_roi, mask_roi, mhi_roi, timestamp, MHI_DURATION)
             color = ((255, 0, 0), (0, 0, 255))[i == 0]
             draw_motion_comp(vis, rect, angle, color)
-            cv2.imshow("vis", vis)
+        cv2.imshow("vis", vis)
 
-    def showCluster(self, mask):
-        motion_tracks = filter(lambda x: len(x) >= 8, self.tracks)
-        motion_tracks = filter(lambda x: np.all(np.absolute(np.subtract(x[-1],x[0])) > 1), motion_tracks)
-        points = np.float32([tr[-1] for tr in motion_tracks]).reshape(-1, 2)    
-        contours, hierarchy = cv2.findContours(mask.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        cluster_n = len(contours)
-        if len(motion_tracks) <= 3 or cluster_n < 1:
-            return
-        if len(motion_tracks) < cluster_n:
-            cluster_n = len(motion_tracks)
-
-        velocity = np.float32([np.subtract(tr[-1],tr[0]) for tr in motion_tracks]).reshape(-1,2)
-        mag, ang = cv2.cartToPolar(velocity[...,0], velocity[...,1])
-        #velocity[...,0] = mag.reshape(mag.shape[0])
-        #velocity[...,1] = ang.reshape(mag.shape[0])
-        cluster_data = np.hstack((points, velocity))
-        #cluster_n = 10
-        labels = DBSCAN(eps=15).fit_predict(cluster_data)
-        #ret, labels, self.centers = (cv2.kmeans(cluster_data, cluster_n, self.cluster_criteria, attempts=20, flags=cv2.KMEANS_RANDOM_CENTERS, centers=self.centers))
-        #centers, labels = kmeans2(cluster_data, cluster_n)
-        #centers = self.centers
-        clusters = defaultdict(list)        
-        for (x,y), label in zip(points.reshape(-1,2), labels.ravel()):
-            if label != -1:
-                clusters[label].append((x,y))
-
-        self.clusters = []
-        for key, val in clusters.iteritems():
-            self.clusters.append(Cluster(val))
-            
     def processFrame(self, frame):
         self.prev_frame = self.cur_frame
         self.cur_frame = FrameData(frame);
@@ -199,20 +185,6 @@ class Tracking:
                     del tr[0]
                 new_tracks.append(tr)
             self.tracks = new_tracks
-            self.cullTracks()
-
-    def cullTracks(self):
-        self.tracks.sort()
-        new_tracks = []
-        prev = None
-        for tr in self.tracks:
-            x,y = tr[-1]
-            x = int(x)
-            y = int(y)
-            if prev == None or prev != (x, y):
-                new_tracks.append(tr)
-                prev = (x,y)
-        self.tracks = new_tracks    
         
     def nextFrame(self, frame):
         self.frame_index += 1
@@ -231,49 +203,25 @@ class Tracking:
     def debug(self):
         iters = 3
         img = self.cur_frame.frame.copy()
-        cv2.polylines(img, [np.int32(tr) for tr in self.tracks], False, (0, 255, 0))
-        cv2.putText(img, "Tracks %d" % len(self.tracks), (0,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0))
-        mask = self.fgmask.copy()        
-        k = np.ones((3,3))
-        cv2.imshow("mask", mask)
-        retval, mask =cv2.threshold(mask, 200, 255, cv2.THRESH_BINARY) #get rid of shadows
-        #self.motionTracking(mask)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
-        mask = cv2.dilate(mask,k,iterations=iters)
-        mask = cv2.erode(mask, k, iterations=iters*2)
-        mask = cv2.dilate(mask, k, iterations=iters)
-        cv2.imshow("dist2", mask)
-        contours, hierarchy = cv2.findContours(mask.copy(), cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)  
-        motion = np.zeros_like(self.cur_frame.frame)
-        #self.showCluster(mask)
-        self.highlightMotion(motion)
-        cv2.drawContours(img, contours, -1, (255,0,0), 3)
-        [c.draw(img) for c in self.clusters]
-        cv2.imshow("motion", motion)
-        cv2.imshow("cur frame", img)
-        #cv2.imshow('fgmask', mask)
-        #canny = cv2.Canny(self.cur_frame.frame, 80, 100)
-        #cv2.imshow("canny", canny)
+        cv2.putText(img, "Hot: %d" % len(self.hotpoints), (0,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0))
+        cv2.putText(img, "Frame: %d" % self.frame_index, (0,60), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0))
+        cv2.putText(img, "Tracks: %d" % len(self.tracks), (0,90), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0))
+        mask = self.fgmask.copy()
+        motion = self.highlightMotion(img)
         self.motionTracking(cv2.cvtColor(motion, cv2.COLOR_BGR2GRAY))
-        #self.motionTracking(mask)
+        cv2.polylines(img, [np.int32(tr) for tr in self.tracks], False, (0, 255, 0))
+        cv2.imshow("Result", img)
         cv2.waitKey(1)
 
 
 if __name__ == '__main__':
-    t = Tracking()    
-    if True:
-        imgs = glob.glob("dataset/Walking/img/*.jpg")
-        imgs.sort()
-        
-        for imgname in imgs[0:]:
-            t.nextFrame(cv2.imread(imgname))
-    else:
-        cap = cv2.VideoCapture("annex/qmul_junction.mp4")
-        ret = 1
-        samples = 0
-        while ret != 0:
-            ret, frame = cap.read()
-            t.nextFrame(frame)
-                
-                
+    t = Tracking()        
+    cap = cv2.VideoCapture(sys.argv[1])
+    ret = 1
+    samples = 0
+    while ret != 0:
+        ret, frame = cap.read()
+        if ret == 0:
+            continue
+        t.nextFrame(frame)
     cv2.destroyAllWindows()
