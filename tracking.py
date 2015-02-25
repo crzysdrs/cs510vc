@@ -1,9 +1,13 @@
 #!/usr/bin/env python
 import numpy as np
 import cv2
+from kalman2d import Kalman2D
 import glob
 import sys
 from pygame import Rect as PyRect
+
+def pyrect2np(rect):    
+    return np.matrix([rect.x, rect.y, 1], np.float32)
 
 def draw_motion_comp(vis, (x, y, w, h), angle, color):
     cv2.rectangle(vis, (x, y), (x+w, y+h), (0, 255, 0))
@@ -31,6 +35,7 @@ class TrackManager:
         [x.draw(img) for x in self.tracked]
 
     def addRect(self, area):
+        #pyRect (left, top, width, height)
         new_area = PyRect(area[0], area[1], area[2], area[3])
         
         possible = filter(lambda x: x.rect.colliderect(new_area), self.tracked)
@@ -40,21 +45,66 @@ class TrackManager:
             p = possible[0]
             p.updateRect(new_area)
         else:
-            #multiple overlaps? merge?
+            #hits multiple existing tracked items, ignore
             pass
-        
+    
+    def updateFrame(self, img, img_hsv):
+        [x.updateFrame(img_hsv) for x in self.tracked]
+
 class Tracked:
     def __init__(self, rect, points):
         self.color = np.random.randint(0,255,3)
         self.rect = rect
         self.points = points
+        self.roi_hist = None
+        self.kalman = Kalman2D(x=self.rect.x, y=self.rect.y)
+        self.term_crit = ( cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 1 )
+        
+        self.camshift = None
+        self.updated = False
+
+    def updateHist(self, img_hsv):
+        r = self.rect
+        hsv_roi = img_hsv[r.top:r.bottom, r.left:r.right]
+        mask = cv2.inRange(hsv_roi, np.array((0., 60.,32.)), np.array((180.,255.,255.)))
+        roi_hist = cv2.calcHist([hsv_roi],[0],mask,[180],[0,180])
+        cv2.normalize(roi_hist,roi_hist,0,255,cv2.NORM_MINMAX)
+        self.roi_hist = roi_hist
 
     def draw(self, img):
         cv2.rectangle(img, self.rect.topleft, self.rect.bottomright,
                       self.color)
 
+        #if self.camshift != None:
+        #    box = cv2.cv.BoxPoints(self.camshift)
+        #    box = np.int0(box)
+        #    cv2.drawContours(img,[box],0,(0,0,255),2)
+
+    def updateFrame(self, img_hsv):
+        if self.roi_hist == None:
+            self.updateHist(img_hsv)
+
+        if not self.updated:
+            self.kalman.update_none()
+            predict = self.kalman.getPredicted()
+            self.rect.x = predict[0]
+            self.rect.y = predict[1]
+        self.updated = False
+        #dst = cv2.calcBackProject([img_hsv],[0],self.roi_hist,[0,180],1)
+        #if r.width <= 0 or r.height <=0:
+        #    return
+        #ret, tw = cv2.CamShift(dst, (r.left, r.top, r.width, r.height), self.term_crit)
+        #self.rect = PyRect(tw[0], tw[1], tw[2], tw[3])        
+        self.camshift = ret
+
     def updateRect(self, rect):
-        self.rect = rect
+        if not self.updated:
+            self.rect = rect
+            self.kalman.update(self.rect.x, self.rect.y)
+            self.updated = True
+    def mergeRect(self, rect):
+        pass
+        #elf.rect = self.rect.union(rect)
 
 class Tracking:
     def __init__(self):
@@ -126,26 +176,47 @@ class Tracking:
         return motion_img
 
     def motionTracking(self, motion_mask):
-        MHI_DURATION = 4
-        MAX_TIME_DELTA = 20
-        MIN_TIME_DELTA = 2
+        MHI_DURATION = 5
+        MAX_TIME_DELTA = 10
+        MIN_TIME_DELTA = 3
         h, w = self.cur_frame.frame.shape[:2]
         hsv = np.zeros((h, w, 3), np.uint8)
         hsv[:,:,1] = 255
+        if not self.prev_frame:
+            return
         if self.motion_history == None:
             self.motion_history = np.zeros((h, w), np.float32)
         motion_history = self.motion_history
         timestamp = self.frame_index
+        frame_diff = cv2.absdiff(self.cur_frame.frame, self.prev_frame.frame)
+        #frame_diff = cv2.morphologyEx(frame_diff,cv2.MORPH_OPEN,np.ones((5,5)), iterations = 1)
+        cv2.imshow("frame_diff", frame_diff)
+        gray_diff = cv2.cvtColor(frame_diff, cv2.COLOR_BGR2GRAY)
+        gray_diff = cv2.bitwise_or(gray_diff, motion_mask)
+        cv2.imshow("gray_diff", gray_diff)
+        ret, motion_mask = cv2.threshold(gray_diff, 10, 255, cv2.THRESH_BINARY)
+        kernel = np.ones((2,2),np.uint8)
+        mymask = self.fgmask.copy()
+        mymask = cv2.morphologyEx(mymask,cv2.MORPH_OPEN,np.ones((3,3)), iterations = 1)
+        mymask = cv2.dilate(mymask, np.ones((3,3)))
+        cv2.imshow("fgmask_unmod", self.fgmask)
+        ret, mymask = cv2.threshold(mymask, 20, 255, cv2.THRESH_BINARY)
+        if self.frame_index > 50:
+            gray_diff_masked = cv2.addWeighted(gray_diff, 1, mymask, 0.25, 0.0)
+        else:
+            gray_diff_masked = gray_diff
+
+        cv2.imshow("masked", gray_diff_masked)
+        ret, motion_mask = cv2.threshold(gray_diff_masked, 20, 1, cv2.THRESH_BINARY)
         cv2.updateMotionHistory(motion_mask, motion_history, timestamp, MHI_DURATION)
         mg_mask, mg_orient = cv2.calcMotionGradient(motion_history, MAX_TIME_DELTA, MIN_TIME_DELTA, apertureSize=7 )
         seg_mask, seg_bounds = cv2.segmentMotion(motion_history, timestamp, MAX_TIME_DELTA)
         
-        visual_name = 'grad_orient'
+        visual_name = 'motion_hist'
         if visual_name == 'input':
             vis = self.cur_frame.frame.copy()
         elif visual_name == 'frame_diff':
-            pass
-            #vis = frame_diff.copy()
+            vis = frame_diff.copy()
         elif visual_name == 'motion_hist':
             vis = np.uint8(np.clip((motion_history-(timestamp-MHI_DURATION)) / MHI_DURATION, 0, 1)*255)
             vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
@@ -179,9 +250,7 @@ class Tracking:
         self.oldframes.append(self.cur_frame)
         if len(self.oldframes) > self.history:
             del self.oldframes[0]
-
-        self.fgmask = self.fgbg.apply(self.cur_frame.frame, learningRate=0.001)
-
+        self.fgmask = self.fgbg.apply(self.cur_frame.frame, learningRate=0.003)
         if self.prev_frame and len(self.tracks) > 0:
             last_points = np.float32([tr[-1] for tr in self.tracks]).reshape(-1, 1, 2)
             found_points, st0, _ = cv2.calcOpticalFlowPyrLK(
@@ -215,6 +284,8 @@ class Tracking:
         self.frame_index += 1
         self.processFrame(frame)
         self.updateTrackingPoints()
+        self.trackmanager.updateFrame(self.cur_frame.frame,
+                                      cv2.cvtColor(self.cur_frame.frame, cv2.COLOR_BGR2HSV))
         self.debug()
 
     def updateTrackingPoints(self):
@@ -244,13 +315,14 @@ class Tracking:
 
 
 if __name__ == '__main__':
-    t = Tracking()        
-    cap = cv2.VideoCapture(sys.argv[1])
-    ret = 1
-    samples = 0
-    while ret != 0:
-        ret, frame = cap.read()
-        if ret == 0:
-            continue
-        t.nextFrame(frame)
+    while(1):
+        t = Tracking()        
+        cap = cv2.VideoCapture(sys.argv[1])
+        ret = 1
+        samples = 0
+        while ret != 0:
+            ret, frame = cap.read()
+            if ret == 0:
+                continue
+            t.nextFrame(frame)
     cv2.destroyAllWindows()
