@@ -3,9 +3,7 @@ import numpy as np
 import cv2
 import glob
 import sys
-from scipy.cluster.vq import kmeans2
-from sklearn.cluster import DBSCAN
-from collections import defaultdict
+from pygame import Rect as PyRect
 
 def draw_motion_comp(vis, (x, y, w, h), angle, color):
     cv2.rectangle(vis, (x, y), (x+w, y+h), (0, 255, 0))
@@ -25,17 +23,39 @@ class FrameData:
         self.gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         self.track_points = None
 
-class Cluster:
-    def __init__(self, cluster):
-        self.color = np.random.randint(0,255,3)      
-        self.cluster = cluster
+class TrackManager:
+    def __init__(self):
+        self.tracked = []
 
     def draw(self, img):
-        rect= cv2.minAreaRect(np.array(self.cluster))
-        box = cv2.cv.BoxPoints(rect)
-        box = np.int0(box)
-        cv2.drawContours(img,[box],0,self.color,2)
-    
+        [x.draw(img) for x in self.tracked]
+
+    def addRect(self, area):
+        new_area = PyRect(area[0], area[1], area[2], area[3])
+        
+        possible = filter(lambda x: x.rect.colliderect(new_area), self.tracked)
+        if len(possible) == 0:
+            self.tracked.append(Tracked(new_area, []))
+        elif len(possible) == 1:
+            p = possible[0]
+            p.updateRect(new_area)
+        else:
+            #multiple overlaps? merge?
+            pass
+        
+class Tracked:
+    def __init__(self, rect, points):
+        self.color = np.random.randint(0,255,3)
+        self.rect = rect
+        self.points = points
+
+    def draw(self, img):
+        cv2.rectangle(img, self.rect.topleft, self.rect.bottomright,
+                      self.color)
+
+    def updateRect(self, rect):
+        self.rect = rect
+
 class Tracking:
     def __init__(self):
         self.oldframes = []
@@ -47,6 +67,8 @@ class Tracking:
         self.clusters = []
         self.history = 100
         self.motion_history = None
+        self.trackmanager = TrackManager()
+
         self.lk_params = dict( 
             winSize  = (10, 10), 
             maxLevel = 5, 
@@ -118,7 +140,7 @@ class Tracking:
         mg_mask, mg_orient = cv2.calcMotionGradient(motion_history, MAX_TIME_DELTA, MIN_TIME_DELTA, apertureSize=7 )
         seg_mask, seg_bounds = cv2.segmentMotion(motion_history, timestamp, MAX_TIME_DELTA)
         
-        visual_name = 'motion_hist'
+        visual_name = 'grad_orient'
         if visual_name == 'input':
             vis = self.cur_frame.frame.copy()
         elif visual_name == 'frame_diff':
@@ -133,6 +155,8 @@ class Tracking:
             vis = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
         for i, rect in enumerate([(0, 0, w, h)] + list(seg_bounds)):
+            if i == 0:
+                continue
             x, y, rw, rh = rect
             area = rw*rh
             if area < 400:
@@ -145,6 +169,7 @@ class Tracking:
                 continue
             angle = cv2.calcGlobalOrientation(orient_roi, mask_roi, mhi_roi, timestamp, MHI_DURATION)
             color = ((255, 0, 0), (0, 0, 255))[i == 0]
+            self.trackmanager.addRect(rect)
             draw_motion_comp(vis, rect, angle, color)
         cv2.imshow("vis", vis)
 
@@ -203,14 +228,18 @@ class Tracking:
     def debug(self):
         iters = 3
         img = self.cur_frame.frame.copy()
-        cv2.putText(img, "Hot: %d" % len(self.hotpoints), (0,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0))
-        cv2.putText(img, "Frame: %d" % self.frame_index, (0,60), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0))
-        cv2.putText(img, "Tracks: %d" % len(self.tracks), (0,90), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0))
+        cv2.putText(img, "Hot: %d" % len(self.hotpoints),
+                    (0,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0))
+        cv2.putText(img, "Frame: %d" % self.frame_index,
+                    (0,60), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0))
+        cv2.putText(img, "Tracks: %d" % len(self.tracks),
+                    (0,90), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0))
         mask = self.fgmask.copy()
         motion = self.highlightMotion(img)
         self.motionTracking(cv2.cvtColor(motion, cv2.COLOR_BGR2GRAY))
         cv2.polylines(img, [np.int32(tr) for tr in self.tracks], False, (0, 255, 0))
-        cv2.imshow("Result", img)
+        self.trackmanager.draw(img)
+        cv2.imshow("Result", img)        
         cv2.waitKey(1)
 
 
