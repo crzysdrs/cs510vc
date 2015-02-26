@@ -126,8 +126,8 @@ class Tracking:
         )
         
         self.feature_params = dict(
-            maxCorners = 3000, 
-            qualityLevel = 0.15,
+            maxCorners = 5000, 
+            qualityLevel = 0.10,
             minDistance = 3,
             blockSize = 3
         )
@@ -141,7 +141,7 @@ class Tracking:
         self.centers = None
 
     def highlightMotion(self, img):
-        circle_radius = 4
+        circle_radius = 3
         motion_img = np.zeros_like(self.cur_frame.frame)
         tracks = filter(lambda x: len(x) < 10, self.tracks)
         motion_tracks = filter(lambda x: len(x) >= 10, self.tracks)
@@ -166,7 +166,7 @@ class Tracking:
             try:
                 target = motion_img[p[1], p[0]]            
                 if np.all(target == 0):
-                    cv2.circle(motion_img, (p[0], p[1]), circle_radius, map(int, c), -1)
+                    cv2.circle(motion_img, (p[0], p[1]), circle_radius, (255,255,255), -1)
                     cv2.circle(img, (p[0], p[1]), circle_radius, map(int, c), -1)
                     culledtracks.append(t)
             except IndexError:
@@ -175,40 +175,51 @@ class Tracking:
         self.tracks = tracks + culledtracks
         return motion_img
 
-    def motionTracking(self, motion_mask):
-        MHI_DURATION = 5
+    def optFlowMotionMask(self, tracked_points):
+        frame_diff = cv2.absdiff(self.cur_frame.frame, self.prev_frame.frame) 
+        frame_diff = cv2.cvtColor(frame_diff, cv2.COLOR_BGR2GRAY)
+        #ret, frame_diff = cv2.threshold(frame_diff, 1, 255, cv2.THRESH_BINARY)
+        cv2.imshow("frame_diff", frame_diff)
+        flow = cv2.calcOpticalFlowFarneback(self.prev_frame.gray, self.cur_frame.gray,
+                                            0.5, 3, 15, 3, 5, 1.2, 0)
+        mag, ang = cv2.cartToPolar(flow[...,0], flow[...,1])
+        optical_flow = np.zeros((self.h,self.w,1), np.uint8)
+        #optical_flow[:,:,0] = cv2.normalize(mag,None,0,255,cv2.NORM_MINMAX)
+        optical_flow[:,:,0] = np.clip(mag * 255, 0, 255)
+        ret, optical_flow = cv2.threshold(optical_flow, 30, 255, cv2.THRESH_BINARY)
+
+        mask = self.fgmask.copy()
+        #remove shadow
+        ret, mask = cv2.threshold(mask, 128, 255, cv2.THRESH_BINARY)
+        #remove noise
+        #mask = cv2.morphologyEx(mask,cv2.MORPH_OPEN,np.ones((3,3)), iterations = 1)
+        #include tracked points
+        mask = cv2.bitwise_or(mask, tracked_points)
+        #include silhouettes
+        #mask = cv2.bitwise_or(mask, frame_diff)
+        #mask all nonmoving parts of the image
+        mask = cv2.bitwise_and(mask, optical_flow)
+        #mask = cv2.morphologyEx(mask,cv2.MORPH_CLOSE,np.ones((4,4)), iterations = 1)
+        #ret, mask = cv2.threshold(cv2.distanceTransform(mask, cv2.cv.CV_DIST_L2, 3).astype(np.uint8), 1, 255, cv2.THRESH_BINARY)
+        return mask
+
+    def motionTracking(self, tracked_points):
+        MHI_DURATION = 2
         MAX_TIME_DELTA = 10
-        MIN_TIME_DELTA = 3
-        h, w = self.cur_frame.frame.shape[:2]
-        hsv = np.zeros((h, w, 3), np.uint8)
+        MIN_TIME_DELTA = 2
+        hsv = np.zeros((self.h, self.w, 3), np.uint8)
         hsv[:,:,1] = 255
         if not self.prev_frame:
             return
         if self.motion_history == None:
-            self.motion_history = np.zeros((h, w), np.float32)
+            self.motion_history = np.zeros((self.h, self.w), np.float32)
         motion_history = self.motion_history
-        timestamp = self.frame_index
-        frame_diff = cv2.absdiff(self.cur_frame.frame, self.prev_frame.frame)
-        #frame_diff = cv2.morphologyEx(frame_diff,cv2.MORPH_OPEN,np.ones((5,5)), iterations = 1)
-        cv2.imshow("frame_diff", frame_diff)
-        gray_diff = cv2.cvtColor(frame_diff, cv2.COLOR_BGR2GRAY)
-        gray_diff = cv2.bitwise_or(gray_diff, motion_mask)
-        cv2.imshow("gray_diff", gray_diff)
-        ret, motion_mask = cv2.threshold(gray_diff, 10, 255, cv2.THRESH_BINARY)
-        kernel = np.ones((2,2),np.uint8)
-        mymask = self.fgmask.copy()
-        mymask = cv2.morphologyEx(mymask,cv2.MORPH_OPEN,np.ones((3,3)), iterations = 1)
-        mymask = cv2.dilate(mymask, np.ones((3,3)))
-        cv2.imshow("fgmask_unmod", self.fgmask)
-        ret, mymask = cv2.threshold(mymask, 20, 255, cv2.THRESH_BINARY)
-        if self.frame_index > 50:
-            gray_diff_masked = cv2.addWeighted(gray_diff, 1, mymask, 0.25, 0.0)
-        else:
-            gray_diff_masked = gray_diff
 
-        cv2.imshow("masked", gray_diff_masked)
-        ret, motion_mask = cv2.threshold(gray_diff_masked, 20, 1, cv2.THRESH_BINARY)
-        cv2.updateMotionHistory(motion_mask, motion_history, timestamp, MHI_DURATION)
+        optflow_mask = self.optFlowMotionMask(tracked_points)
+        timestamp = self.frame_index
+        cv2.imshow("optflow_mask", optflow_mask)
+        chosen_mask = optflow_mask
+        cv2.updateMotionHistory(chosen_mask, motion_history, timestamp, MHI_DURATION)
         mg_mask, mg_orient = cv2.calcMotionGradient(motion_history, MAX_TIME_DELTA, MIN_TIME_DELTA, apertureSize=7 )
         seg_mask, seg_bounds = cv2.segmentMotion(motion_history, timestamp, MAX_TIME_DELTA)
         
@@ -225,14 +236,14 @@ class Tracking:
             hsv[:,:,2] = mg_mask*255
             vis = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
-        for i, rect in enumerate([(0, 0, w, h)] + list(seg_bounds)):
+        for i, rect in enumerate([(0, 0, self.w, self.h)] + list(seg_bounds)):
             if i == 0:
                 continue
             x, y, rw, rh = rect
             area = rw*rh
             if area < 400:
                 continue
-            silh_roi   = motion_mask   [y:y+rh,x:x+rw]
+            silh_roi   = chosen_mask   [y:y+rh,x:x+rw]
             orient_roi = mg_orient     [y:y+rh,x:x+rw]
             mask_roi   = mg_mask       [y:y+rh,x:x+rw]
             mhi_roi    = motion_history[y:y+rh,x:x+rw]
@@ -280,10 +291,14 @@ class Tracking:
                 new_tracks.append(tr)
             self.tracks = new_tracks
         
+    def seedBackground(self, img):
+        self.fgmask = self.fgbg.apply(img, learningRate=0.003)
+
     def nextFrame(self, frame):
         self.frame_index += 1
         self.processFrame(frame)
         self.updateTrackingPoints()
+        self.h, self.w = self.cur_frame.frame.shape[:2]
         self.trackmanager.updateFrame(self.cur_frame.frame,
                                       cv2.cvtColor(self.cur_frame.frame, cv2.COLOR_BGR2HSV))
         self.debug()
@@ -316,10 +331,18 @@ class Tracking:
 
 if __name__ == '__main__':
     while(1):
-        t = Tracking()        
-        cap = cv2.VideoCapture(sys.argv[1])
+        t = Tracking()
         ret = 1
         samples = 0
+        cap = cv2.VideoCapture(sys.argv[1])
+        while samples < 100 and ret != 0:
+            ret, frame = cap.read()
+            if ret == 0:
+                continue
+            t.seedBackground(frame)
+            samples += 1
+
+        cap = cv2.VideoCapture(sys.argv[1])
         while ret != 0:
             ret, frame = cap.read()
             if ret == 0:
