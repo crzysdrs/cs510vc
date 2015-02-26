@@ -81,7 +81,7 @@ class TrackManager:
         #pyRect (left, top, width, height)
         new_area = PyRect(area[0], area[1], area[2], area[3])
         tracks = self.tracker.tracks
-        matching_tracks = filter (lambda tr : new_area.collidepoint(tr[0]), tracks)
+        matching_tracks = filter (lambda tr : new_area.collidepoint(tr[-1]), tracks)
                
         possible = filter(lambda x: x.rect.colliderect(new_area), self.tracked)
         if len(matching_tracks) == 0:
@@ -91,7 +91,7 @@ class TrackManager:
             self.tracked.append(Tracked(self, new_area, [tr[-1] for tr in matching_tracks]))
         elif len(possible) == 1:
             p = possible[0]
-            #p.updateRect(new_area)
+            p.updateRect(new_area)
         else:
             #hits multiple existing tracked items, ignore
             pass
@@ -110,6 +110,8 @@ class Tracked:
         self.k_center = Kalman2D(x=self.rect.centerx, y=self.rect.centery)
         self.term_crit = ( cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 1 )       
         self.updated = False
+        self.cor = None
+        self.rect_updated = False
 
     def updateCenter(self):
         if len(self.points) > 1:
@@ -127,31 +129,49 @@ class Tracked:
             cv2.rectangle(img, self.rect.topleft, self.rect.bottomright,
                           self.color)
 
-    def updateFrame(self):
-        self.age += 1
+    def updatePoints(self):
+        tracks = self.manager.tracker.tracks
+        matching_points = [p[-1] for p in filter (lambda tr : self.rect.collidepoint(tr[-1]), tracks)]
+        self.points = matching_points
+
+    def findCorrespondence(self):
+        if self.cor != None:
+            return
         match = followPoints(self.manager.tracker.prev_frame,
                              self.manager.tracker.cur_frame,
                              np.float32(self.points).reshape(-1, 2))
+        self.cor = match
 
+    def updateFrame(self):
+        self.age += 1
+        self.findCorrespondence()
         #keep found points
-        self.points = [p[2] for p in filter(lambda p : p[0], match)]
+        self.points = [p[2] for p in filter(lambda p : p[0], self.cor)]
         old_center = self.center
         old_rect = self.rect.copy()
-        self.center = self.updateCenter()
-        if len(self.points) == 0:
+        #self.center = self.updateCenter()
+        if len(self.points) == 0 or not self.rect_updated:
             self.k_center.update_none()
             predict = self.k_center.getPredicted()
             self.rect.center = tuple(predict)
         else:
             #self.rect.center = np.add(np.subtract(old_center, old_rect.center), self.center)
-            self.rect.center = self.center
+            #self.rect.center = self.center
             self.k_center.update(self.rect.center[0], self.rect.center[1])
 
+        self.cor = None
+        self.rect_updated = False
+
     def updateRect(self, rect):
-        self.rect = rect
-        self.k_center.update(self.rect.centerx, self.rect.centery)
-        self.updated = True
-        
+        self.findCorrespondence()
+        find = [p[2] for p in filter(lambda p : p[0], self.cor)]
+        contained = [rect.collidepoint(x) for x in find]
+        if len(find) > 0 and len(contained) / len(find) > 0.50:
+            old_rect = self.rect.copy()
+            self.rect.size = (np.array(old_rect.size) - np.array(rect.size)) / 2 + rect.size
+            self.rect.center =(np.array(old_rect.center) - np.array(rect.center)) / 2 + np.array(rect.center)
+            self.updatePoints()
+            self.rect_updated = True
 
 class Tracking:
     def __init__(self):
@@ -214,7 +234,8 @@ class Tracking:
             except IndexError:
                 pass
 
-        self.tracks = tracks + culledtracks
+        #self.tracks = tracks + culledtracks
+        self.tracks = tracks
         return motion_img
 
     def optFlowMotionMask(self, tracked_points):
