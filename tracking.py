@@ -6,6 +6,48 @@ import glob
 import sys
 from pygame import Rect as PyRect
 
+
+lk_params = dict( 
+    winSize  = (10, 10), 
+    maxLevel = 5, 
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03)
+)
+
+
+def followPoints(prev_frame, cur_frame, last_points):
+    if len(last_points) == 0:
+        return []
+
+    found_points, st0, _ = cv2.calcOpticalFlowPyrLK(
+        prev_frame.gray, 
+        cur_frame.gray,
+        last_points,
+        None,
+        **lk_params
+    )            
+    refound_points, st1, _ = cv2.calcOpticalFlowPyrLK(
+        cur_frame.gray,
+        prev_frame.gray,
+        found_points,
+        None, 
+        **lk_params
+    )
+    potential_points = abs(last_points-refound_points).reshape(-1, 2).max(-1)
+    within_range = abs(refound_points - last_points).reshape(-1,2).max(-1) < 1
+    new_tracks = []
+    corresponding = []
+    for old_p, (x,y), range_ok in zip(last_points, found_points.reshape(-1,2), within_range):
+        corresponding.append((range_ok, old_p, (x,y)))
+    return corresponding
+
+def fold(f, l, a):
+    """
+    f: the function to apply
+    l: the list to fold
+    a: the accumulator, who is also the 'zero' on the first call
+    """ 
+    return a if(len(l) == 0) else fold(f, l[1:], f(a, l[0]))
+
 def pyrect2np(rect):    
     return np.matrix([rect.x, rect.y, 1], np.float32)
 
@@ -28,8 +70,9 @@ class FrameData:
         self.track_points = None
 
 class TrackManager:
-    def __init__(self):
+    def __init__(self, tracker):
         self.tracked = []
+        self.tracker = tracker
 
     def draw(self, img):
         [x.draw(img) for x in self.tracked]
@@ -37,74 +80,78 @@ class TrackManager:
     def addRect(self, area):
         #pyRect (left, top, width, height)
         new_area = PyRect(area[0], area[1], area[2], area[3])
-        
+        tracks = self.tracker.tracks
+        matching_tracks = filter (lambda tr : new_area.collidepoint(tr[0]), tracks)
+               
         possible = filter(lambda x: x.rect.colliderect(new_area), self.tracked)
-        if len(possible) == 0:
-            self.tracked.append(Tracked(new_area, []))
+        if len(matching_tracks) == 0:
+            # no feature points means we would have a hard time tracking
+            pass
+        elif len(possible) == 0:
+            self.tracked.append(Tracked(self, new_area, [tr[-1] for tr in matching_tracks]))
         elif len(possible) == 1:
             p = possible[0]
-            p.updateRect(new_area)
+            #p.updateRect(new_area)
         else:
             #hits multiple existing tracked items, ignore
             pass
     
     def updateFrame(self, img, img_hsv):
-        [x.updateFrame(img_hsv) for x in self.tracked]
+        [x.updateFrame() for x in self.tracked]
 
 class Tracked:
-    def __init__(self, rect, points):
+    def __init__(self, manager, rect, points):
+        self.manager = manager
         self.color = np.random.randint(0,255,3)
         self.rect = rect
+        self.age = 0
         self.points = points
-        self.roi_hist = None
-        self.kalman = Kalman2D(x=self.rect.x, y=self.rect.y)
-        self.term_crit = ( cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 1 )
-        
-        self.camshift = None
+        self.center = self.updateCenter()
+        self.k_center = Kalman2D(x=self.rect.centerx, y=self.rect.centery)
+        self.term_crit = ( cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 1 )       
         self.updated = False
 
-    def updateHist(self, img_hsv):
-        r = self.rect
-        hsv_roi = img_hsv[r.top:r.bottom, r.left:r.right]
-        mask = cv2.inRange(hsv_roi, np.array((0., 60.,32.)), np.array((180.,255.,255.)))
-        roi_hist = cv2.calcHist([hsv_roi],[0],mask,[180],[0,180])
-        cv2.normalize(roi_hist,roi_hist,0,255,cv2.NORM_MINMAX)
-        self.roi_hist = roi_hist
+    def updateCenter(self):
+        if len(self.points) > 1:
+            p = fold(lambda p, q : np.add(p, q), self.points, (0,0))
+            p = p / len(self.points)
+            new_center = p
+        elif len(self.points) == 1:
+            new_center = self.points[0]
+        else:            
+            new_center = self.center
+        return new_center
 
     def draw(self, img):
-        cv2.rectangle(img, self.rect.topleft, self.rect.bottomright,
-                      self.color)
+        if len(self.points) > 0:
+            cv2.rectangle(img, self.rect.topleft, self.rect.bottomright,
+                          self.color)
 
-        #if self.camshift != None:
-        #    box = cv2.cv.BoxPoints(self.camshift)
-        #    box = np.int0(box)
-        #    cv2.drawContours(img,[box],0,(0,0,255),2)
+    def updateFrame(self):
+        self.age += 1
+        match = followPoints(self.manager.tracker.prev_frame,
+                             self.manager.tracker.cur_frame,
+                             np.float32(self.points).reshape(-1, 2))
 
-    def updateFrame(self, img_hsv):
-        if self.roi_hist == None:
-            self.updateHist(img_hsv)
-
-        if not self.updated:
-            self.kalman.update_none()
-            predict = self.kalman.getPredicted()
-            self.rect.x = predict[0]
-            self.rect.y = predict[1]
-        self.updated = False
-        #dst = cv2.calcBackProject([img_hsv],[0],self.roi_hist,[0,180],1)
-        #if r.width <= 0 or r.height <=0:
-        #    return
-        #ret, tw = cv2.CamShift(dst, (r.left, r.top, r.width, r.height), self.term_crit)
-        #self.rect = PyRect(tw[0], tw[1], tw[2], tw[3])        
-        self.camshift = ret
+        #keep found points
+        self.points = [p[2] for p in filter(lambda p : p[0], match)]
+        old_center = self.center
+        old_rect = self.rect.copy()
+        self.center = self.updateCenter()
+        if len(self.points) == 0:
+            self.k_center.update_none()
+            predict = self.k_center.getPredicted()
+            self.rect.center = tuple(predict)
+        else:
+            #self.rect.center = np.add(np.subtract(old_center, old_rect.center), self.center)
+            self.rect.center = self.center
+            self.k_center.update(self.rect.center[0], self.rect.center[1])
 
     def updateRect(self, rect):
-        if not self.updated:
-            self.rect = rect
-            self.kalman.update(self.rect.x, self.rect.y)
-            self.updated = True
-    def mergeRect(self, rect):
-        pass
-        #elf.rect = self.rect.union(rect)
+        self.rect = rect
+        self.k_center.update(self.rect.centerx, self.rect.centery)
+        self.updated = True
+        
 
 class Tracking:
     def __init__(self):
@@ -117,13 +164,8 @@ class Tracking:
         self.clusters = []
         self.history = 100
         self.motion_history = None
-        self.trackmanager = TrackManager()
+        self.trackmanager = TrackManager(self)
 
-        self.lk_params = dict( 
-            winSize  = (10, 10), 
-            maxLevel = 5, 
-            criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03)
-        )
         
         self.feature_params = dict(
             maxCorners = 5000, 
@@ -180,12 +222,13 @@ class Tracking:
         frame_diff = cv2.cvtColor(frame_diff, cv2.COLOR_BGR2GRAY)
         #ret, frame_diff = cv2.threshold(frame_diff, 1, 255, cv2.THRESH_BINARY)
         cv2.imshow("frame_diff", frame_diff)
+
         flow = cv2.calcOpticalFlowFarneback(self.prev_frame.gray, self.cur_frame.gray,
                                             0.5, 3, 15, 3, 5, 1.2, 0)
         mag, ang = cv2.cartToPolar(flow[...,0], flow[...,1])
         optical_flow = np.zeros((self.h,self.w,1), np.uint8)
-        #optical_flow[:,:,0] = cv2.normalize(mag,None,0,255,cv2.NORM_MINMAX)
-        optical_flow[:,:,0] = np.clip(mag * 255, 0, 255)
+        optical_flow[:,:,0] = cv2.normalize(mag,None,0,255,cv2.NORM_MINMAX)
+        #optical_flow[:,:,0] = np.clip(mag * 255, 0, 255)
         ret, optical_flow = cv2.threshold(optical_flow, 30, 255, cv2.THRESH_BINARY)
 
         mask = self.fgmask.copy()
@@ -196,7 +239,7 @@ class Tracking:
         #include tracked points
         mask = cv2.bitwise_or(mask, tracked_points)
         #include silhouettes
-        #mask = cv2.bitwise_or(mask, frame_diff)
+        #mask = cv2.bitwise_and(mask, frame_diff)
         #mask all nonmoving parts of the image
         mask = cv2.bitwise_and(mask, optical_flow)
         #mask = cv2.morphologyEx(mask,cv2.MORPH_CLOSE,np.ones((4,4)), iterations = 1)
@@ -269,14 +312,14 @@ class Tracking:
                 self.cur_frame.gray,
                 last_points,
                 None,
-                **self.lk_params
+                **lk_params
             )            
             refound_points, st1, _ = cv2.calcOpticalFlowPyrLK(
                 self.cur_frame.gray,
                 self.prev_frame.gray,
                 found_points,
                 None, 
-                **self.lk_params
+                **lk_params
             )
             potential_points = abs(last_points-refound_points).reshape(-1, 2).max(-1)
             within_range = abs(refound_points - last_points).reshape(-1,2).max(-1) < 1
