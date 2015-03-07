@@ -1,0 +1,1 @@
+sudo apt-get install libopencv-dev python-numpy python-pygame python-opencv build-essential

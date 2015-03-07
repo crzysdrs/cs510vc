@@ -92,4 +92,5 @@ tramp
 .cask/
 
 #project specific
-dataset
+result.jpg
+stitcher
