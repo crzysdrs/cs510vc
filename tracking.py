@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+from __future__ import division
 import numpy as np
 import cv2
 from kalman2d import Kalman2D
@@ -53,9 +54,9 @@ def pyrect2np(rect):
 
 def draw_motion_comp(vis, (x, y, w, h), angle, color):
     cv2.rectangle(vis, (x, y), (x+w, y+h), (0, 255, 0))
-    r = min(w/2, h/2)
-    cx, cy = x+w/2, y+h/2
-    angle = angle*np.pi/180
+    r = min(w//2, h//2)
+    cx, cy = x+w//2, y+h//2
+    angle = angle*np.pi//180
     cv2.circle(vis, (cx, cy), r, color, 3)
     cv2.line(vis, (cx, cy), (int(cx+np.cos(angle)*r), int(cy+np.sin(angle)*r)), color, 3)
 
@@ -73,6 +74,7 @@ class TrackManager:
     def __init__(self, tracker):
         self.tracked = []
         self.tracker = tracker
+        self.next_id = 0
 
     def draw(self, img):
         [x.draw(img) for x in self.tracked]
@@ -88,7 +90,8 @@ class TrackManager:
             # no feature points means we would have a hard time tracking
             pass
         elif len(possible) == 0:
-            self.tracked.append(Tracked(self, new_area, [tr[-1] for tr in matching_tracks]))
+            self.tracked.append(Tracked(self.next_id, self, new_area, [tr[-1] for tr in matching_tracks]))
+            self.next_id += 1
         elif len(possible) == 1:
             p = possible[0]
             p.updateRect(new_area)
@@ -96,11 +99,15 @@ class TrackManager:
             #hits multiple existing tracked items, ignore
             pass
     
-    def updateFrame(self, img, img_hsv):
+    def updateFrame(self, img, img_hsv):        
+        h, w = img.shape[:2]
+        img_rect = PyRect(0,0,w,h)
+        self.tracked = filter(lambda x : x.inFrame(img_rect), self.tracked)
         [x.updateFrame() for x in self.tracked]
 
-class Tracked:
-    def __init__(self, manager, rect, points):
+class Tracked:    
+    def __init__(self, my_id, manager, rect, points):
+        self.id = my_id
         self.manager = manager
         self.color = np.random.randint(0,255,3)
         self.rect = rect
@@ -112,6 +119,16 @@ class Tracked:
         self.updated = False
         self.cor = None
         self.rect_updated = False
+        self.notify("Created %s" % self.rect)
+
+    def inFrame(self, img_rect):
+        res = self.rect.colliderect(img_rect)
+        if not res:
+            self.notify("No longer in frame")
+        return res
+
+    def notify(self, msg):
+        print "(Frame %04d) ID %03d : %s" % (self.manager.tracker.frame_index, self.id, msg)
 
     def updateCenter(self):
         if len(self.points) > 1:
@@ -126,8 +143,14 @@ class Tracked:
 
     def draw(self, img):
         if len(self.points) > 0:
-            cv2.rectangle(img, self.rect.topleft, self.rect.bottomright,
-                          self.color)
+            text_color = (255,255,255)
+        else:
+            text_color = (0,0,255)
+
+        cv2.rectangle(img, self.rect.topleft, self.rect.bottomright,
+                      self.color) 
+        cv2.putText(img, "%d" % self.id,
+                    self.rect.bottomleft, cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color)
 
     def updatePoints(self):
         tracks = self.manager.tracker.tracks
@@ -135,6 +158,7 @@ class Tracked:
         self.points = matching_points
 
     def findCorrespondence(self):
+        #only allows this to be done once per frame
         if self.cor != None:
             return
         match = followPoints(self.manager.tracker.prev_frame,
@@ -146,7 +170,7 @@ class Tracked:
         self.age += 1
         self.findCorrespondence()
         #keep found points
-        self.points = [p[2] for p in filter(lambda p : p[0], self.cor)]
+        #self.points = [p[2] for p in filter(lambda p : p[0], self.cor)]
         old_center = self.center
         old_rect = self.rect.copy()
         #self.center = self.updateCenter()
@@ -159,20 +183,33 @@ class Tracked:
             #self.rect.center = self.center
             self.k_center.update(self.rect.center[0], self.rect.center[1])
 
+        self.updatePoints()
         self.cor = None
         self.rect_updated = False
+    
+    def mergeRect(self, old_rect, new_rect):
+        merged_rect = PyRect(0,0,0,0)
+        merged_rect.size = (np.array(old_rect.size) - np.array(new_rect.size)) / 2 + new_rect.size
+        merged_rect.center =(np.array(old_rect.center) - np.array(new_rect.center)) / 2 + np.array(new_rect.center)
+        return merged_rect
 
-    def updateRect(self, rect):
+    def updateRect(self, new_rect):
         self.findCorrespondence()
         find = [p[2] for p in filter(lambda p : p[0], self.cor)]
-        contained = [rect.collidepoint(x) for x in find]
-        if len(find) > 0 and len(contained) / len(find) > 0.50:
-            old_rect = self.rect.copy()
-            self.rect.size = (np.array(old_rect.size) - np.array(rect.size)) / 2 + rect.size
-            self.rect.center =(np.array(old_rect.center) - np.array(rect.center)) / 2 + np.array(rect.center)
-            self.updatePoints()
-            self.rect_updated = True
+        old_rect = self.rect
+        proposed_rect = self.mergeRect(old_rect, new_rect)
 
+        all_rects = [new_rect, proposed_rect, old_rect]
+        matched = [(r, len(filter(lambda p : p == True, [r.collidepoint(x) for x in find]))) for r in all_rects]
+
+        best_fit = max(matched, key=lambda m : m[1])
+        if best_fit[1] != old_rect and len(find) > 0 and best_fit[1] / len(find) > 0.80:
+            self.notify("Found Correspondence %s of %s" % (best_fit[1], len(find)))
+            self.rect = best_fit[0]
+            self.rect_updated = True
+        else:
+            self.notify("Lost Correspondence %s of %s" % (best_fit[1], len(find)))
+                        
 class Tracking:
     def __init__(self):
         self.oldframes = []
@@ -394,22 +431,21 @@ class Tracking:
 
 
 if __name__ == '__main__':
-    while(1):
-        t = Tracking()
-        ret = 1
-        samples = 0
-        cap = cv2.VideoCapture(sys.argv[1])
-        while samples < 100 and ret != 0:
-            ret, frame = cap.read()
-            if ret == 0:
-                continue
-            t.seedBackground(frame)
-            samples += 1
+    t = Tracking()
+    ret = 1
+    samples = 0
+    cap = cv2.VideoCapture(sys.argv[1])
+    while samples < 100 and ret != 0:
+        ret, frame = cap.read()
+        if ret == 0:
+            continue
+        t.seedBackground(frame)
+        samples += 1
 
-        cap = cv2.VideoCapture(sys.argv[1])
-        while ret != 0:
-            ret, frame = cap.read()
-            if ret == 0:
-                continue
-            t.nextFrame(frame)
+    cap = cv2.VideoCapture(sys.argv[1])
+    while ret != 0:
+        ret, frame = cap.read()
+        if ret == 0:
+            continue
+        t.nextFrame(frame)
     cv2.destroyAllWindows()
