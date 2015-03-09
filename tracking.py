@@ -243,6 +243,8 @@ class Object:
         self.notify("Watching %d points" % (len(self.point_tracks)))
 
     def determineRect(self):
+        if len(self.rects) == 0:
+            return
         find = map(lambda p: p.current(), self.point_tracks)
         updated = False
         perfect = None
@@ -251,22 +253,22 @@ class Object:
             x,y,w,h = cv2.boundingRect(search)
             perfect = PyRect(x,y,w,h)
 
-        for (index, new_rect) in enumerate(self.rects):
-            old_rect = self.rect
-            proposed_rect = self.mergeRect(old_rect, new_rect)
+        new_rect = self.rects[0].unionall(self.rects[1:])
+        old_rect = self.rect
+        proposed_rect = self.mergeRect(old_rect, new_rect)
 
-            all_rects = [("new", new_rect), ("proposed", proposed_rect)]
-            matched = [len(filter(lambda p : p == True, [r[1].collidepoint(x) for x in find])) for r in all_rects]
-            best_fit = max(zip(all_rects, matched), key=lambda m : m[1])
+        all_rects = [("new", new_rect), ("proposed", proposed_rect)]
+        matched = [len(filter(lambda p : p == True, [r[1].collidepoint(x) for x in find])) for r in all_rects]
+        best_fit = max(zip(all_rects, matched), key=lambda m : m[1])
 
-            percent = 0
-            if len(find) > 0:
-                percent = best_fit[1] / len(find)
+        percent = 0
+        if len(find) > 0:
+            percent = best_fit[1] / len(find)
 
-            best_fit = best_fit[0]
-            if best_fit[1] != old_rect and percent > 0.70:
-                self.rect = best_fit[1]
-                updated = True
+        best_fit = best_fit[0]
+        if best_fit[1] != old_rect and percent > 0.70:
+            self.rect = best_fit[1]
+            updated = True
 
         self.rects = []
 
