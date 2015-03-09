@@ -7,40 +7,6 @@ import glob
 import sys
 from pygame import Rect as PyRect
 
-
-lk_params = dict( 
-    winSize  = (10, 10), 
-    maxLevel = 5, 
-    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03)
-)
-
-
-def followPoints(prev_frame, cur_frame, last_points):
-    if len(last_points) == 0:
-        return []
-
-    found_points, st0, _ = cv2.calcOpticalFlowPyrLK(
-        prev_frame.gray, 
-        cur_frame.gray,
-        last_points,
-        None,
-        **lk_params
-    )            
-    refound_points, st1, _ = cv2.calcOpticalFlowPyrLK(
-        cur_frame.gray,
-        prev_frame.gray,
-        found_points,
-        None, 
-        **lk_params
-    )
-    potential_points = abs(last_points-refound_points).reshape(-1, 2).max(-1)
-    within_range = abs(refound_points - last_points).reshape(-1,2).max(-1) < 1
-    new_tracks = []
-    corresponding = []
-    for old_p, (x,y), range_ok in zip(last_points, found_points.reshape(-1,2), within_range):
-        corresponding.append((range_ok, old_p, (x,y)))
-    return corresponding
-
 def fold(f, l, a):
     """
     f: the function to apply
@@ -64,166 +30,27 @@ def object_seg(a, b):
     dist = np.linalg.norm(a[0:1]-b[0:1])
     return dist * (a[2] - b[2])**2 + (a[3] - b[3])**2 / 5 * 2
 
-class FrameData:
-    def __init__(self, frame):
-        self.frame = frame
-        self.gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        self.track_points = None
+def dist(a, b):
+    return np.linalg.norm(np.array(a)-np.array(b))
 
-class TrackManager:
-    def __init__(self, tracker):
-        self.tracked = []
-        self.tracker = tracker
-        self.next_id = 0
-
-    def draw(self, img):
-        [x.draw(img) for x in self.tracked]
-
-    def addRect(self, area):
-        #pyRect (left, top, width, height)
-        new_area = PyRect(area[0], area[1], area[2], area[3])
-        tracks = self.tracker.tracks
-        matching_tracks = filter (lambda tr : new_area.collidepoint(tr[-1]), tracks)
-               
-        possible = filter(lambda x: x.rect.colliderect(new_area), self.tracked)
-        if len(matching_tracks) == 0:
-            # no feature points means we would have a hard time tracking
-            pass
-        elif len(possible) == 0:
-            self.tracked.append(Tracked(self.next_id, self, new_area, [tr[-1] for tr in matching_tracks]))
-            self.next_id += 1
-        elif len(possible) == 1:
-            p = possible[0]
-            p.updateRect(new_area)
+def partition(pred, items):
+    bools = map(pred, items)
+    l_a = []
+    l_b = []
+    for (b, item) in zip(bools, items):
+        if b:
+            l_a.append(item)
         else:
-            #hits multiple existing tracked items, ignore
-            pass
-    
-    def updateFrame(self, img, img_hsv):        
-        h, w = img.shape[:2]
-        img_rect = PyRect(0,0,w,h)
-        self.tracked = filter(lambda x : x.inFrame(img_rect), self.tracked)
-        [x.updateFrame() for x in self.tracked]
+            l_b.append(item)
+    return (l_a, l_b)
 
-class Tracked:    
-    def __init__(self, my_id, manager, rect, points):
-        self.id = my_id
-        self.manager = manager
-        self.color = np.random.randint(0,255,3)
-        self.rect = rect
-        self.age = 0
-        self.points = points
-        self.center = self.updateCenter()
-        self.k_center = Kalman2D(x=self.rect.centerx, y=self.rect.centery)
-        self.term_crit = ( cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 1 )       
-        self.updated = False
-        self.cor = None
-        self.rect_updated = False
-        self.notify("Created %s" % self.rect)
 
-    def inFrame(self, img_rect):
-        res = self.rect.colliderect(img_rect)
-        if not res:
-            self.notify("No longer in frame")
-        return res
+split_tracks = lambda x: len(x.history()) >= 5
 
-    def notify(self, msg):
-        print "(Frame %04d) ID %03d : %s" % (self.manager.tracker.frame_index, self.id, msg)
-
-    def updateCenter(self):
-        if len(self.points) > 1:
-            p = fold(lambda p, q : np.add(p, q), self.points, (0,0))
-            p = p / len(self.points)
-            new_center = p
-        elif len(self.points) == 1:
-            new_center = self.points[0]
-        else:            
-            new_center = self.center
-        return new_center
-
-    def draw(self, img):
-        if len(self.points) > 0:
-            text_color = (255,255,255)
-        else:
-            text_color = (0,0,255)
-
-        cv2.rectangle(img, self.rect.topleft, self.rect.bottomright,
-                      self.color) 
-        cv2.putText(img, "%d" % self.id,
-                    self.rect.bottomleft, cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color)
-
-    def updatePoints(self):
-        tracks = self.manager.tracker.tracks
-        matching_points = [p[-1] for p in filter (lambda tr : self.rect.collidepoint(tr[-1]), tracks)]
-        self.points = matching_points
-
-    def findCorrespondence(self):
-        #only allows this to be done once per frame
-        if self.cor != None:
-            return
-        match = followPoints(self.manager.tracker.prev_frame,
-                             self.manager.tracker.cur_frame,
-                             np.float32(self.points).reshape(-1, 2))
-        self.cor = match
-
-    def updateFrame(self):
-        self.age += 1
-        self.findCorrespondence()
-        #keep found points
-        #self.points = [p[2] for p in filter(lambda p : p[0], self.cor)]
-        old_center = self.center
-        old_rect = self.rect.copy()
-        #self.center = self.updateCenter()
-        if len(self.points) == 0 or not self.rect_updated:
-            self.k_center.update_none()
-            predict = self.k_center.getPredicted()
-            self.rect.center = tuple(predict)
-        else:
-            #self.rect.center = np.add(np.subtract(old_center, old_rect.center), self.center)
-            #self.rect.center = self.center
-            self.k_center.update(self.rect.center[0], self.rect.center[1])
-
-        self.updatePoints()
-        self.cor = None
-        self.rect_updated = False
-    
-    def mergeRect(self, old_rect, new_rect):
-        merged_rect = PyRect(0,0,0,0)
-        merged_rect.size = (np.array(old_rect.size) - np.array(new_rect.size)) / 2 + new_rect.size
-        merged_rect.center =(np.array(old_rect.center) - np.array(new_rect.center)) / 2 + np.array(new_rect.center)
-        return merged_rect
-
-    def updateRect(self, new_rect):
-        self.findCorrespondence()
-        find = [p[2] for p in filter(lambda p : p[0], self.cor)]
-        old_rect = self.rect
-        proposed_rect = self.mergeRect(old_rect, new_rect)
-
-        all_rects = [new_rect, proposed_rect, old_rect]
-        matched = [(r, len(filter(lambda p : p == True, [r.collidepoint(x) for x in find]))) for r in all_rects]
-
-        best_fit = max(matched, key=lambda m : m[1])
-        if best_fit[1] != old_rect and len(find) > 0 and best_fit[1] / len(find) > 0.80:
-            self.notify("Found Correspondence %s of %s" % (best_fit[1], len(find)))
-            self.rect = best_fit[0]
-            self.rect_updated = True
-        else:
-            self.notify("Lost Correspondence %s of %s" % (best_fit[1], len(find)))
-                        
-class Tracking:
+class AllTracks:
+    MOVING_SPEED = 0.5
     def __init__(self):
-        self.oldframes = []
-        self.refresh_interval = 1
-        self.tracks = []
-        self.hotpoints = []
-        self.track_len = 10
-        self.frame_index = 0
-        self.clusters = []
-        self.history = 100
-        self.motion_history = None
-        self.trackmanager = TrackManager(self)
-
-        
+        self.point_tracks = []
         self.feature_params = dict(
             maxCorners = 5000, 
             qualityLevel = 0.10,
@@ -231,7 +58,260 @@ class Tracking:
             blockSize = 3
         )
 
-        self.cluster_criteria = (cv2.TERM_CRITERIA_EPS, 30, 0.1)
+    def getTracks(self):
+        return map(lambda x : x.history(), self.point_tracks)
+
+    def getPointTracks(self):
+        return self.point_tracks
+    
+    def getMovingTracks(self, speed=None):
+        if not speed:
+            speed = AllTracks.MOVING_SPEED
+        (short_tracks, long_tracks) = partition(split_tracks, self.point_tracks)
+        motion_tracks = filter(lambda x: dist(x.current(), x.last()) > speed, long_tracks)
+        return motion_tracks
+
+    def count(self):
+        return len(self.point_tracks)
+    
+    def refresh(self, cur_frame):
+        (short_tracks, long_tracks) = partition(split_tracks, self.point_tracks)
+        motion_tracks = filter(lambda x: dist(x.current(), x.last()) > AllTracks.MOVING_SPEED, long_tracks)
+        points = cv2.goodFeaturesToTrack(cur_frame.gray, **self.feature_params)
+        self.point_tracks = short_tracks + motion_tracks + [PointTrack(p) for p in points.reshape(-1,2)]
+        
+    def update(self, prev_frame, cur_frame):
+        if prev_frame == None:
+            return
+        lk_params = dict( 
+            winSize  = (10, 10), 
+            maxLevel = 5, 
+            criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03)
+        )
+        last_points = np.array(map(lambda t : t.current(), self.point_tracks)).reshape(-1,2)
+        found_points, st0, _ = cv2.calcOpticalFlowPyrLK(
+            prev_frame.gray, 
+            cur_frame.gray,
+            last_points,
+            None,
+            **lk_params
+        )            
+        refound_points, st1, _ = cv2.calcOpticalFlowPyrLK(
+            cur_frame.gray,
+            prev_frame.gray,
+            found_points,
+            None, 
+            **lk_params
+        )
+        potential_points = abs(last_points-refound_points).reshape(-1, 2).max(-1)
+        within_range = abs(refound_points - last_points).reshape(-1,2).max(-1) < 1
+        updated_tracks = []
+        for pt, (x,y), range_ok in zip(self.point_tracks, found_points.reshape(-1,2), within_range):
+            if range_ok:
+                pt.addHistory((x,y))
+                updated_tracks.append(pt)
+            else:
+                pt.missing()
+        
+        self.point_tracks = updated_tracks
+
+class PointTrack:
+    next_id = 0
+    max_len = 10
+    def __init__(self, point):
+        self.id = PointTrack.next_id
+        PointTrack.next_id += 1
+        self.track = [point]
+        self.death_notify = []
+
+    def addDeathObserver(self, observer):
+        self.death_notify.append(observer)
+
+    def addHistory(self, new_point):
+        self.track.append(new_point)
+        if len(self.track) > PointTrack.max_len:
+            del self.track[0]
+        
+    def current(self):
+        return self.track[-1]
+
+    def last(self):
+        return self.track[0]
+
+    def missing(self):
+        for n in self.death_notify:
+            n(self)
+
+    def history(self):
+        return self.track
+
+
+class FrameData:
+    def __init__(self, frame):
+        self.frame = frame
+        self.gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        self.track_points = None
+
+class ObjectManager:
+    def __init__(self, tracker):
+        self.objects = []
+        self.tracker = tracker
+        self.next_id = 0
+
+    def draw(self, img):
+        [o.draw(img) for o in self.objects]
+
+    def addRect(self, area):
+        #pyRect (left, top, width, height)
+        new_area = PyRect(area[0], area[1], area[2], area[3])
+        tracks = map(lambda x : x.current(), self.tracker.all_tracks.getMovingTracks())
+        matching_tracks = filter (lambda t : new_area.collidepoint(t), tracks)            
+        possible = filter(lambda x: x.rect.colliderect(new_area), self.objects)
+        if len(matching_tracks) == 0:
+            # no feature points means we would have a hard time tracking
+            pass
+        elif len(possible) == 0:
+            self.objects.append(Object(self.next_id, self, new_area))
+            self.next_id += 1
+        elif len(possible) == 1:
+            p = possible[0]
+            p.addRect(new_area)
+        else:
+            #hits multiple existing tracked items, ignore
+            pass
+    
+    def updateFrame(self, img):
+        h, w = img.shape[:2]
+        img_rect = PyRect(0,0,w,h)
+        self.objects = filter(lambda x : not x.killMe(img_rect), self.objects)
+        [o.updateFrame() for o in self.objects]
+
+class Object:
+    tooYoung = 10
+    def __init__(self, my_id, manager, rect):
+        self.id = my_id
+        self.manager = manager
+        self.color = np.random.randint(0,255,3)
+        self.rect = rect
+        self.age = 0
+        self.k_center = Kalman2D(x=self.rect.centerx, y=self.rect.centery)
+        self.term_crit = ( cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 1 )       
+        self.rects = []
+        self.point_tracks = []
+        self.updates = 0
+        self.updatePoints()
+        self.notify("Created %s" % self.rect)
+        self.kalman_used = False
+        self.history = []
+
+    def killMe(self, img_rect):
+        if not self.rect.colliderect(img_rect):
+            self.notify("No longer in frame")
+            return True
+        elif self.age >= Object.tooYoung and self.updates < Object.tooYoung / 2:
+            self.notify("Aborted, Age %d Updates %d" % (self.age, self.updates))
+            return True
+        else:
+            return False
+
+    def notify(self, msg):
+        print "(Frame %04d) ID %03d : %s" % (self.manager.tracker.frame_index, self.id, msg)
+
+    def draw(self, img):
+        if self.age <= Object.tooYoung:
+            return
+        if self.kalman_used:
+            text_color = (0,0,255)
+        else:
+            text_color = (255,255,255)
+
+        for p in self.point_tracks:
+            cv2.circle(img, p.current(), 3, self.color, -1)
+
+        cv2.rectangle(img, self.rect.topleft, self.rect.bottomright,
+                      self.color) 
+        cv2.putText(img, "%d" % self.id,
+                    self.rect.bottomleft, cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color)
+
+    def removePointTrack(self, pt):
+        self.point_tracks = filter(lambda p: p != pt, self.point_tracks)
+
+    def updatePoints(self):
+        tracks = self.manager.tracker.all_tracks.getMovingTracks()
+        self.point_tracks = filter(lambda t : self.rect.collidepoint(t.current()), tracks)
+        map(lambda pt : pt.addDeathObserver(self.removePointTrack), self.point_tracks)
+        self.notify("Watching %d points" % (len(self.point_tracks)))
+
+    def determineRect(self):
+        find = map(lambda p: p.current(), self.point_tracks)
+        updated = False
+        perfect = None
+        if len(find) > 0:
+            search = np.array(find, dtype=np.int32).reshape(-1, 1, 2)
+            x,y,w,h = cv2.boundingRect(search)
+            perfect = PyRect(x,y,w,h)
+
+        for (index, new_rect) in enumerate(self.rects):
+            old_rect = self.rect
+            proposed_rect = self.mergeRect(old_rect, new_rect)
+
+            all_rects = [("new", new_rect), ("proposed", proposed_rect)]
+            matched = [len(filter(lambda p : p == True, [r[1].collidepoint(x) for x in find])) for r in all_rects]
+            best_fit = max(zip(all_rects, matched), key=lambda m : m[1])
+
+            percent = 0
+            if len(find) > 0:
+                percent = best_fit[1] / len(find)
+
+            best_fit = best_fit[0]
+            if best_fit[1] != old_rect and percent > 0.70:
+                self.rect = best_fit[1]
+                updated = True
+
+        self.rects = []
+
+        if updated:
+            self.updates += 1
+
+        return updated
+
+    def updateFrame(self):
+        self.age += 1
+        updated = self.determineRect()
+        if not updated:
+            self.k_center.update_none()
+            predict = self.k_center.getPredicted()
+            self.rect.center = tuple(predict)
+        else:
+            self.k_center.update(self.rect.center[0], self.rect.center[1])
+        self.updatePoints()
+        self.kalman_used = not updated
+        self.cor = None
+        self.history.append(self.rect.copy())
+        if len(self.history) > 10:
+            del self.history[0]
+        
+       
+    def mergeRect(self, old_rect, new_rect):
+        merged_rect = PyRect(0,0,0,0)
+        merged_rect.size = (np.array(old_rect.size) - np.array(new_rect.size)) / 2 + new_rect.size
+        merged_rect.center =(np.array(old_rect.center) - np.array(new_rect.center)) / 2 + np.array(new_rect.center)
+        return merged_rect
+
+    def addRect(self, new_rect):
+        self.rects.append(new_rect);
+                        
+class Tracking:
+    LEARNING_RATE = 0.003
+    
+    def __init__(self):
+        self.oldframes = []
+        self.refresh_interval = 1
+        self.frame_index = 0
+        self.history = 100
+        self.motion_history = None
+        self.objmanager = ObjectManager(self)
+        self.all_tracks = AllTracks()
         self.fgmask = None
         self.fgbg = cv2.BackgroundSubtractorMOG2()
         self.cur_frame = None
@@ -242,44 +322,20 @@ class Tracking:
     def highlightMotion(self, img):
         circle_radius = 3
         motion_img = np.zeros_like(self.cur_frame.frame)
-        tracks = filter(lambda x: len(x) < 10, self.tracks)
-        motion_tracks = filter(lambda x: len(x) >= 10, self.tracks)
-        motion_tracks = filter(lambda x: np.any(np.absolute(np.subtract(x[-1],x[0])) > 2), motion_tracks)
-        if len(motion_tracks) == 0:
-            return motion_img
-        points = np.float32([tr[-1] for tr in motion_tracks]).reshape(-1, 2)
-        velocity = np.float32([np.subtract(tr[-1],tr[-2]) for tr in motion_tracks]).reshape(-1,2) * 10 **3
-        cluster_data = np.hstack((points, velocity))
-        points = points[(np.absolute(cluster_data[:,2]) > 1) & (np.absolute(cluster_data[:,3]) > 1)]
-        cluster_data = cluster_data[(np.absolute(cluster_data[:,2]) > 1) & (np.absolute(cluster_data[:,3]) > 1)]
-        mag, ang = cv2.cartToPolar(velocity[...,0], velocity[...,1])
-        hsv = np.uint8(np.zeros((mag.shape[0], 3)))
-        hsv[...,0] = (ang*180/np.pi/2).reshape(ang.shape[0])
-        hsv[...,1] = 255
-        hsv[...,2] = cv2.normalize(mag,None,0,255,cv2.NORM_MINMAX).reshape(ang.shape[0])
-        rgb = cv2.cvtColor(hsv.reshape(ang.shape[0], -1, 3),cv2.COLOR_HSV2BGR)
-        rgb = rgb.reshape(ang.shape[0], 3)
-        culledtracks = []
-        for (t, c) in zip(motion_tracks, rgb):
+        #motion_tracks = self.all_tracks.getMovingTracks()
+        motion_tracks = filter(lambda x: len(x) >= 10, self.all_tracks.getTracks())
+        motion_tracks = filter(lambda x: dist(x[-1], x[0]) > 1, motion_tracks)
+        
+        for t in motion_tracks:
             p = map(int, t[-1])
-            try:
-                target = motion_img[p[1], p[0]]            
-                if np.all(target == 0):
-                    cv2.circle(motion_img, (p[0], p[1]), circle_radius, (255,255,255), -1)
-                    cv2.circle(img, (p[0], p[1]), circle_radius, map(int, c), -1)
-                    culledtracks.append(t)
-            except IndexError:
-                pass
+            cv2.circle(motion_img, (p[0], p[1]), circle_radius, (255,255,255), -1)
 
-        #self.tracks = tracks + culledtracks
-        self.tracks = tracks
         return motion_img
 
     def optFlowMotionMask(self, tracked_points):
         frame_diff = cv2.absdiff(self.cur_frame.frame, self.prev_frame.frame) 
         frame_diff = cv2.cvtColor(frame_diff, cv2.COLOR_BGR2GRAY)
         #ret, frame_diff = cv2.threshold(frame_diff, 1, 255, cv2.THRESH_BINARY)
-        cv2.imshow("frame_diff", frame_diff)
 
         flow = cv2.calcOpticalFlowFarneback(self.prev_frame.gray, self.cur_frame.gray,
                                             0.5, 3, 15, 3, 5, 1.2, 0)
@@ -318,7 +374,6 @@ class Tracking:
 
         optflow_mask = self.optFlowMotionMask(tracked_points)
         timestamp = self.frame_index
-        cv2.imshow("optflow_mask", optflow_mask)
         chosen_mask = optflow_mask
         cv2.updateMotionHistory(chosen_mask, motion_history, timestamp, MHI_DURATION)
         mg_mask, mg_orient = cv2.calcMotionGradient(motion_history, MAX_TIME_DELTA, MIN_TIME_DELTA, apertureSize=7 )
@@ -352,7 +407,7 @@ class Tracking:
                 continue
             angle = cv2.calcGlobalOrientation(orient_roi, mask_roi, mhi_roi, timestamp, MHI_DURATION)
             color = ((255, 0, 0), (0, 0, 255))[i == 0]
-            self.trackmanager.addRect(rect)
+            self.objmanager.addRect(rect)
             draw_motion_comp(vis, rect, angle, color)
         cv2.imshow("vis", vis)
 
@@ -362,71 +417,37 @@ class Tracking:
         self.oldframes.append(self.cur_frame)
         if len(self.oldframes) > self.history:
             del self.oldframes[0]
-        self.fgmask = self.fgbg.apply(self.cur_frame.frame, learningRate=0.003)
-        if self.prev_frame and len(self.tracks) > 0:
-            last_points = np.float32([tr[-1] for tr in self.tracks]).reshape(-1, 1, 2)
-            found_points, st0, _ = cv2.calcOpticalFlowPyrLK(
-                self.prev_frame.gray, 
-                self.cur_frame.gray,
-                last_points,
-                None,
-                **lk_params
-            )            
-            refound_points, st1, _ = cv2.calcOpticalFlowPyrLK(
-                self.cur_frame.gray,
-                self.prev_frame.gray,
-                found_points,
-                None, 
-                **lk_params
-            )
-            potential_points = abs(last_points-refound_points).reshape(-1, 2).max(-1)
-            within_range = abs(refound_points - last_points).reshape(-1,2).max(-1) < 1
-            new_tracks = []
-            for tr, (x,y), range_ok in zip(self.tracks, found_points.reshape(-1,2), within_range):
-                last = tr[-1]
-                if not range_ok:
-                    continue
-                tr.append((x,y))
-                if len(tr) > self.track_len:
-                    del tr[0]
-                new_tracks.append(tr)
-            self.tracks = new_tracks
+        self.fgmask = self.fgbg.apply(self.cur_frame.frame, learningRate=Tracking.LEARNING_RATE)
+        self.all_tracks.update(self.prev_frame, self.cur_frame)
         
     def seedBackground(self, img):
-        self.fgmask = self.fgbg.apply(img, learningRate=0.003)
+        self.fgmask = self.fgbg.apply(img, learningRate=Tracking.LEARNING_RATE)
 
     def nextFrame(self, frame):
         self.frame_index += 1
         self.processFrame(frame)
         self.updateTrackingPoints()
         self.h, self.w = self.cur_frame.frame.shape[:2]
-        self.trackmanager.updateFrame(self.cur_frame.frame,
-                                      cv2.cvtColor(self.cur_frame.frame, cv2.COLOR_BGR2HSV))
+        self.objmanager.updateFrame(self.cur_frame.frame)
         self.debug()
 
     def updateTrackingPoints(self):
         if self.frame_index % self.refresh_interval == 0:
-            motion_tracks = filter(lambda x: len(x) >= self.refresh_interval, self.tracks)
-            motion_tracks = filter(lambda x: np.any(np.absolute(np.subtract(x[-1],x[0])) > 0.25), motion_tracks)
-            self.tracks = motion_tracks;
-            points = cv2.goodFeaturesToTrack(self.cur_frame.gray, **self.feature_params)
-            self.tracks += [[(x,y)] for (x,y) in points.reshape(-1,2)]
+            self.all_tracks.refresh(self.cur_frame)
 
     def debug(self):
         iters = 3
         img = self.cur_frame.frame.copy()
-        cv2.putText(img, "Hot: %d" % len(self.hotpoints),
-                    (0,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0))
         cv2.putText(img, "Frame: %d" % self.frame_index,
+                    (0,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0))
+        cv2.putText(img, "Tracks: %d" % self.all_tracks.count(),
                     (0,60), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0))
-        cv2.putText(img, "Tracks: %d" % len(self.tracks),
-                    (0,90), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0))
         mask = self.fgmask.copy()
-        motion = self.highlightMotion(img)
+        motion = self.highlightMotion(img.copy())
         self.motionTracking(cv2.cvtColor(motion, cv2.COLOR_BGR2GRAY))
-        cv2.polylines(img, [np.int32(tr) for tr in self.tracks], False, (0, 255, 0))
-        self.trackmanager.draw(img)
-        cv2.imshow("Result", img)        
+        #cv2.polylines(img, [np.int32(tr) for tr in self.tracks], False, (0, 255, 0))
+        self.objmanager.draw(img)
+        cv2.imshow("Result", img)
         cv2.waitKey(1)
 
 
