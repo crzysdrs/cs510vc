@@ -26,13 +26,6 @@ def draw_motion_comp(vis, (x, y, w, h), angle, color):
     cv2.circle(vis, (cx, cy), r, color, 3)
     cv2.line(vis, (cx, cy), (int(cx+np.cos(angle)*r), int(cy+np.sin(angle)*r)), color, 3)
 
-def object_seg(a, b):
-    dist = np.linalg.norm(a[0:1]-b[0:1])
-    return dist * (a[2] - b[2])**2 + (a[3] - b[3])**2 / 5 * 2
-
-def dist(a, b):
-    return np.linalg.norm(np.array(a)-np.array(b))
-
 def partition(pred, items):
     bools = map(pred, items)
     l_a = []
@@ -68,7 +61,7 @@ class AllTracks:
         if not speed:
             speed = AllTracks.MOVING_SPEED
         (short_tracks, long_tracks) = partition(split_tracks, self.point_tracks)
-        motion_tracks = filter(lambda x: dist(x.current(), x.last()) > speed, long_tracks)
+        motion_tracks = filter(lambda x: x.dist > speed, long_tracks)
         return motion_tracks
 
     def count(self):
@@ -76,7 +69,7 @@ class AllTracks:
     
     def refresh(self, cur_frame):
         (short_tracks, long_tracks) = partition(split_tracks, self.point_tracks)
-        motion_tracks = filter(lambda x: dist(x.current(), x.last()) > AllTracks.MOVING_SPEED, long_tracks)
+        motion_tracks = filter(lambda x: x.dist > AllTracks.MOVING_SPEED, long_tracks)
         points = cv2.goodFeaturesToTrack(cur_frame.gray, **self.feature_params)
         self.point_tracks = short_tracks + motion_tracks + [PointTrack(p) for p in points.reshape(-1,2)]
         
@@ -112,8 +105,14 @@ class AllTracks:
                 updated_tracks.append(pt)
             else:
                 pt.missing()
-        
+
         self.point_tracks = updated_tracks
+
+        curr = np.array(map(lambda x : x.current(), self.point_tracks))
+        last = np.array(map(lambda x : x.last(), self.point_tracks))
+        dist = np.linalg.norm(curr-last, axis=1)
+        for d, pt in zip(dist, self.point_tracks):
+            pt.dist = d
 
 class PointTrack:
     next_id = 0
@@ -123,6 +122,7 @@ class PointTrack:
         PointTrack.next_id += 1
         self.track = [point]
         self.death_notify = []
+        self.dist = 0
 
     def addDeathObserver(self, observer):
         self.death_notify.append(observer)
@@ -134,6 +134,9 @@ class PointTrack:
         
     def current(self):
         return self.track[-1]
+
+    def dist(self):
+        return self.dist
 
     def last(self):
         return self.track[0]
@@ -325,9 +328,10 @@ class Tracking:
         circle_radius = 3
         motion_img = np.zeros_like(self.cur_frame.frame)
         #motion_tracks = self.all_tracks.getMovingTracks()
-        motion_tracks = filter(lambda x: len(x) >= 10, self.all_tracks.getTracks())
-        motion_tracks = filter(lambda x: dist(x[-1], x[0]) > 1, motion_tracks)
-        
+        motion_tracks = filter(lambda x: len(x.history()) >= 10, self.all_tracks.getPointTracks())
+        motion_tracks = filter(lambda x: x.dist > 1, motion_tracks)
+        motion_tracks = map(lambda x: x.history(), motion_tracks)
+
         for t in motion_tracks:
             p = map(int, t[-1])
             cv2.circle(motion_img, (p[0], p[1]), circle_radius, (255,255,255), -1)
