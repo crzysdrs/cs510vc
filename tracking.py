@@ -41,7 +41,7 @@ def partition(pred, items):
 split_tracks = lambda x: len(x.history()) >= 5
 
 class AllTracks:
-    MOVING_SPEED = 0.5
+    MOVING_SPEED = 1
     def __init__(self):
         self.point_tracks = []
         self.feature_params = dict(
@@ -111,8 +111,13 @@ class AllTracks:
         curr = np.array(map(lambda x : x.current(), self.point_tracks))
         last = np.array(map(lambda x : x.last(), self.point_tracks))
         dist = np.linalg.norm(curr-last, axis=1)
-        for d, pt in zip(dist, self.point_tracks):
+        count = (np.array(map(lambda x: len(x.history()), self.point_tracks)))
+        vel = (curr - last)
+        vel[::,0] = vel[::,0] / count
+        vel[::,1] = vel[::,1] / count
+        for v, d, pt in zip(vel, dist, self.point_tracks):
             pt.dist = d
+            pt.vel = v
 
 class PointTrack:
     next_id = 0
@@ -123,6 +128,7 @@ class PointTrack:
         self.track = [point]
         self.death_notify = []
         self.dist = 0
+        self.vel = 0
 
     def addDeathObserver(self, observer):
         self.death_notify.append(observer)
@@ -141,9 +147,12 @@ class PointTrack:
     def last(self):
         return self.track[0]
 
-    def missing(self):
+    def missing(self): 
         for n in self.death_notify:
             n(self)
+
+    def velocity(self):
+        return self.vel
 
     def history(self):
         return self.track
@@ -192,10 +201,11 @@ class ObjectManager:
 class Object:
     tooYoung = 10
     def __init__(self, my_id, manager, rect):
+        self.rect = rect
         self.id = my_id
         self.manager = manager
         self.color = np.random.randint(0,255,3)
-        self.rect = rect
+        self.notify("Created %s" % self.rect)
         self.age = 0
         self.k_center = Kalman2D(x=self.rect.centerx, y=self.rect.centery)
         self.term_crit = ( cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 1 )       
@@ -203,9 +213,8 @@ class Object:
         self.point_tracks = []
         self.updates = 0
         self.updatePoints()
-        self.notify("Created %s" % self.rect)
-        self.kalman_used = False
         self.history = []
+        self.method = ""
 
     def killMe(self, img_rect):
         if not self.rect.colliderect(img_rect):
@@ -221,18 +230,26 @@ class Object:
         print "(Frame %04d) ID %03d : %s" % (self.manager.tracker.frame_index, self.id, msg)
 
     def draw(self, img):
-        if self.age <= Object.tooYoung:
-            return
-        if self.kalman_used:
+        if self.method == "kalman":
             text_color = (0,0,255)
-        else:
+        elif self.method == "velocity":
+            text_color = (0,255,0)
+        elif self.method == "motion":
             text_color = (255,255,255)
+        else:
+            text_color = (0,0,0)
 
         for p in self.point_tracks:
             cv2.circle(img, p.current(), 3, self.color, -1)
 
-        cv2.rectangle(img, self.rect.topleft, self.rect.bottomright,
-                      self.color) 
+        draw = True
+        if self.age <= Object.tooYoung:
+            draw = (self.manager.tracker.frame_index % 2 == 0)
+
+        if draw:
+            cv2.rectangle(img, self.rect.topleft, self.rect.bottomright,
+                          self.color) 
+
         cv2.putText(img, "%d" % self.id,
                     self.rect.bottomleft, cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color)
 
@@ -251,16 +268,20 @@ class Object:
         find = map(lambda p: p.current(), self.point_tracks)
         updated = False
         perfect = None
-        if len(find) > 0:
-            search = np.array(find, dtype=np.int32).reshape(-1, 1, 2)
-            x,y,w,h = cv2.boundingRect(search)
-            perfect = PyRect(x,y,w,h)
 
         new_rect = self.rects[0].unionall(self.rects[1:])
         old_rect = self.rect
         proposed_rect = self.mergeRect(old_rect, new_rect)
 
-        all_rects = [("new", new_rect), ("proposed", proposed_rect)]
+        all_rects = [("proposed", proposed_rect, "new_rect", new_rect)]
+
+        if len(find) > 0:
+            search = np.array(find, dtype=np.int32).reshape(-1, 1, 2)
+            x,y,w,h = cv2.boundingRect(search)
+            perfect = PyRect(x,y,w,h)
+            perfect.size = (np.array(self.rect.size) + np.array(perfect.size)) / 2 + np.array(perfect.size)
+            #all_rects += [("perfect", perfect)]
+
         matched = [len(filter(lambda p : p == True, [r[1].collidepoint(x) for x in find])) for r in all_rects]
         best_fit = max(zip(all_rects, matched), key=lambda m : m[1])
 
@@ -284,13 +305,24 @@ class Object:
         self.age += 1
         updated = self.determineRect()
         if not updated:
-            self.k_center.update_none()
-            predict = self.k_center.getPredicted()
-            self.rect.center = tuple(predict)
+            if len(self.point_tracks) == 0:
+                self.k_center.update_none()                
+                self.rect.center = self.k_center.getPredicted()
+                self.method = "kalman"
+            else:
+                velocity_list = np.array(map(lambda x : x.velocity(), self.point_tracks))
+                vel = np.average(velocity_list, axis=0)
+                move_with_vel = tuple(np.array(self.rect.center) + vel)
+                self.k_center.update(move_with_vel[0], move_with_vel[1])
+                self.rect.center = self.k_center.getCorrected()
+                self.method = "velocity"
         else:
             self.k_center.update(self.rect.center[0], self.rect.center[1])
+            self.rect.center = self.k_center.getCorrected()
+            self.method = "motion"
+
         self.updatePoints()
-        self.kalman_used = not updated
+        
         self.cor = None
         self.history.append(self.rect.copy())
         if len(self.history) > 10:
@@ -299,8 +331,8 @@ class Object:
        
     def mergeRect(self, old_rect, new_rect):
         merged_rect = PyRect(0,0,0,0)
-        merged_rect.size = (np.array(old_rect.size) - np.array(new_rect.size)) / 2 + new_rect.size
-        merged_rect.center =(np.array(old_rect.center) - np.array(new_rect.center)) / 2 + np.array(new_rect.center)
+        merged_rect.size = (np.array(new_rect.size) - np.array(old_rect.size)) / 10 + old_rect.size
+        merged_rect.center = (np.array(new_rect.center) - np.array(old_rect.center)) / 0.75 + np.array(old_rect.center)
         return merged_rect
 
     def addRect(self, new_rect):
@@ -328,8 +360,8 @@ class Tracking:
         circle_radius = 3
         motion_img = np.zeros_like(self.cur_frame.frame)
         #motion_tracks = self.all_tracks.getMovingTracks()
-        motion_tracks = filter(lambda x: len(x.history()) >= 10, self.all_tracks.getPointTracks())
-        motion_tracks = filter(lambda x: x.dist > 1, motion_tracks)
+        motion_tracks = filter(lambda x: len(x.history()) >= 5, self.all_tracks.getPointTracks())
+        motion_tracks = filter(lambda x: x.dist > 2, motion_tracks)
         motion_tracks = map(lambda x: x.history(), motion_tracks)
 
         for t in motion_tracks:
@@ -352,8 +384,9 @@ class Tracking:
         ret, optical_flow = cv2.threshold(optical_flow, 30, 255, cv2.THRESH_BINARY)
 
         mask = self.fgmask.copy()
+        cv2.imshow("mask", mask)
         #remove shadow
-        ret, mask = cv2.threshold(mask, 128, 255, cv2.THRESH_BINARY)
+        #ret, mask = cv2.threshold(mask, 128, 255, cv2.THRESH_BINARY)
         #remove noise
         #mask = cv2.morphologyEx(mask,cv2.MORPH_OPEN,np.ones((3,3)), iterations = 1)
         #include tracked points
