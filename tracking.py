@@ -10,18 +10,10 @@ from pygame import Rect as PyRect
 import argparse
 import itertools
 
-def fold(f, l, a):
-    """
-    f: the function to apply
-    l: the list to fold
-    a: the accumulator, who is also the 'zero' on the first call
-    """ 
-    return a if(len(l) == 0) else fold(f, l[1:], f(a, l[0]))
-
-def pyrect2np(rect):    
-    return np.matrix([rect.x, rect.y, 1], np.float32)
-
 def draw_motion_comp(vis, (x, y, w, h), angle, color):
+    """
+    Draw the motion templating information into the specified image.
+    """
     cv2.rectangle(vis, (x, y), (x+w, y+h), (0, 255, 0))
     r = min(w//2, h//2)
     cx, cy = x+w//2, y+h//2
@@ -30,6 +22,9 @@ def draw_motion_comp(vis, (x, y, w, h), angle, color):
     cv2.line(vis, (cx, cy), (int(cx+np.cos(angle)*r), int(cy+np.sin(angle)*r)), color, 3)
 
 def partition(pred, items):
+    """
+    Partition the list items into two lists based on the predicate function.
+    """
     bools = map(pred, items)
     l_a = []
     l_b = []
@@ -44,6 +39,11 @@ def partition(pred, items):
 split_tracks = lambda x: len(x.history()) >= 5
 
 class AllTracks:
+    """
+    AllTracks is a container class for the point tracking.
+    By grouping all this work here, we can more easily interact with opencv
+    via numpy to compute all information for points one time per frame.
+    """
     MOVING_SPEED = 2
     def __init__(self):
         self.point_tracks = []
@@ -145,6 +145,11 @@ class AllTracks:
             pt.vel = v
 
 class PointTrack:
+    """
+    A point track is simply a history for a given point as it moves through frames.
+    This allows us to compute velocity, or movement for a given point, as well
+    as use it to track objects.
+    """
     next_id = 0
     max_len = 10
     def __init__(self, point):
@@ -185,12 +190,18 @@ class PointTrack:
 
 
 class FrameData:
+    """
+    Wrapper for frames, to keep track of gray scale image and not recompute it unneccesarily.
+    """
     def __init__(self, frame):
         self.frame = frame
         self.gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         self.track_points = None
 
 class ObjectManager:
+    """
+    Keeps track of all the objects in the scene.
+    """
     def __init__(self, tracker):
         self.objects = []
         self.tracker = tracker
@@ -228,6 +239,9 @@ class ObjectManager:
         [o.updateFrame() for o in self.objects]
 
 class Object:
+    """
+    Represents a moving object in the scene.
+    """
     tooYoung = 10
     def __init__(self, my_id, manager, rect):
         self.manager = manager
@@ -247,6 +261,9 @@ class Object:
         self.method = ""
 
     def killMe(self, img_rect):
+        """
+        Notify the objectmanager that the object is no longer worth tracking.
+        """
         if not self.rect.colliderect(img_rect):
             self.notify("No longer in frame")
             return True
@@ -257,6 +274,7 @@ class Object:
             return False
 
     def notify(self, msg):
+        """ Debug Routine for keeping track of info related to this object"""
         if self.debug:
             print "(Frame %04d) ID %03d : %s" % (self.manager.tracker.frame_index, self.id, msg)
 
@@ -289,12 +307,14 @@ class Object:
         self.point_tracks = filter(lambda p: p != pt, self.point_tracks)
 
     def updatePoints(self):
+        """ Find all the trackable points in the given object """
         tracks = self.manager.tracker.all_tracks.getMovingTracks()
         self.point_tracks = filter(lambda t : self.rect.collidepoint(t.current()), tracks)
         map(lambda pt : pt.addDeathObserver(self.removePointTrack), self.point_tracks)
         self.notify("Watching %d points" % (len(self.point_tracks)))
 
     def determineRect(self):
+        """ Determine which motion rect in the scene correlates to this object."""
         dist = np.array(self.history[-1].center) - np.array(self.history[0].center)
         angle = math.atan2(dist[1], dist[0]) * 180 / np.pi
 
@@ -369,6 +389,8 @@ class Object:
         self.rects.append((new_rect, angle))
                         
 class Tracking:
+    """
+    The class that handles all the frame reading and visualization of the debug info"""
     LEARNING_RATE = 0.003
     MAX_SIZE = 80 * 80
     MASK_SHADOW = False
@@ -410,7 +432,6 @@ class Tracking:
     def highlightMotion(self, img):
         circle_radius = 3
         motion_img = np.zeros_like(self.cur_frame.frame)
-        #motion_tracks = self.all_tracks.getMovingTracks()
         motion_tracks = filter(lambda x: len(x.history()) >= 5 and x.dist > 2,
                                self.all_tracks.getPointTracks())
         motion_tracks = map(lambda x: x.current(), motion_tracks)
@@ -424,35 +445,26 @@ class Tracking:
         return motion_img
 
     def optFlowMotionMask(self, tracked_points):
-        frame_diff = cv2.absdiff(self.cur_frame.frame, self.prev_frame.frame) 
-        frame_diff = cv2.cvtColor(frame_diff, cv2.COLOR_BGR2GRAY)
-        #ret, frame_diff = cv2.threshold(frame_diff, 1, 255, cv2.THRESH_BINARY)
-
+        """ Build a motion mask """
         flow = cv2.calcOpticalFlowFarneback(self.prev_frame.gray, self.cur_frame.gray,
                                             0.5, 3, 15, 3, 5, 1.2, 0)
         mag, ang = cv2.cartToPolar(flow[...,0], flow[...,1])
         optical_flow = np.zeros((self.h,self.w,1), np.uint8)
         optical_flow[:,:,0] = cv2.normalize(mag,None,0,255,cv2.NORM_MINMAX)
-        #optical_flow[:,:,0] = np.clip(mag * 255, 0, 255)
         ret, optical_flow = cv2.threshold(optical_flow, 30, 255, cv2.THRESH_BINARY)
 
         mask = self.fgmask.copy()
         #remove shadow
         if Tracking.MASK_SHADOW:
             ret, mask = cv2.threshold(mask, 128, 255, cv2.THRESH_BINARY)
-        #remove noise
-        #mask = cv2.morphologyEx(mask,cv2.MORPH_OPEN,np.ones((3,3)), iterations = 1)
         #include tracked points
         mask = cv2.bitwise_or(mask, tracked_points)
-        #include silhouettes
-        #mask = cv2.bitwise_and(mask, frame_diff)
         #mask all nonmoving parts of the image
         mask = cv2.bitwise_and(mask, optical_flow)
-        #mask = cv2.morphologyEx(mask,cv2.MORPH_CLOSE,np.ones((4,4)), iterations = 1)
-        #ret, mask = cv2.threshold(cv2.distanceTransform(mask, cv2.cv.CV_DIST_L2, 3).astype(np.uint8), 1, 255, cv2.THRESH_BINARY)
         return mask
 
     def motionTracking(self, tracked_points):
+        """ Compute the motion template of the image and potentially create objects. """
         MHI_DURATION = 3
         MAX_TIME_DELTA = 10
         MIN_TIME_DELTA = 2
@@ -471,18 +483,8 @@ class Tracking:
         mg_mask, mg_orient = cv2.calcMotionGradient(motion_history, MAX_TIME_DELTA, MIN_TIME_DELTA, apertureSize=7 )
         seg_mask, seg_bounds = cv2.segmentMotion(motion_history, timestamp, MAX_TIME_DELTA)
         
-        visual_name = 'motion_hist'
-        if visual_name == 'input':
-            vis = self.cur_frame.frame.copy()
-        elif visual_name == 'frame_diff':
-            vis = frame_diff.copy()
-        elif visual_name == 'motion_hist':
-            vis = np.uint8(np.clip((motion_history-(timestamp-MHI_DURATION)) / MHI_DURATION, 0, 1)*255)
-            vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
-        elif visual_name == 'grad_orient':
-            hsv[:,:,0] = mg_orient/2
-            hsv[:,:,2] = mg_mask*255
-            vis = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+        vis = np.uint8(np.clip((motion_history-(timestamp-MHI_DURATION)) / MHI_DURATION, 0, 1)*255)
+        vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
 
         for i, rect in enumerate([(0, 0, self.w, self.h)] + list(seg_bounds)):
             if i == 0:
@@ -537,7 +539,9 @@ class Tracking:
         if self.args.debug:
             self.debug(img)
             cv2.imshow("Result", img)
-        
+        elif not self.video:
+            cv2.imshow("Result", img)
+
         if self.video:
             self.video.write(img)
 
@@ -550,11 +554,11 @@ class Tracking:
             self.all_tracks.refresh(self.cur_frame)
 
     def debug(self, img):
+        """ Put any useful debug stuff here """
         cv2.putText(img, "Frame: %d" % self.frame_index,
                     (0,30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0))
         cv2.putText(img, "Tracks: %d" % self.all_tracks.count(),
                     (0,60), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0))
-        #cv2.polylines(img, [np.int32(tr) for tr in self.tracks], False, (0, 255, 0))
         cv2.waitKey(1)
 
 if __name__ == '__main__':
