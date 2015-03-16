@@ -94,3 +94,7 @@ tramp
 #project specific
 dataset
 out/
+report/*.aux
+report/*.pdf
+report/*.tex
+report/*.dot

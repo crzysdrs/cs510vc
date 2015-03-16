@@ -1,0 +1,220 @@
+\documentclass[11pt]{article}
+\usepackage{tabu}
+\usepackage{graphicx}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage[margin=0.5in]{geometry}
+\usepackage{dot2texi}
+\usepackage{tikz}
+\usepackage{cleveref}
+\usepackage{wrapfig}
+
+
+\title{\textbf{Moving Pedestrian and Vehicle Detection and Tracking}}
+\author{Mitch Souders}
+\date{}
+\begin{document}
+\maketitle
+\section{Project Goal}
+Create an OpenCV application that can detect motion and track moving objects in a traffic surveillance video.
+This application was built in Python using primarily the OpenCV and Numpy Python libraries.
+
+\section{Implementation}
+
+\begin{figure}[h]
+\begin{dot2tex}[autosize]
+digraph G {
+  "Optical Flow" -> "Motion Mask"
+  "Background Subtraction" -> "Motion Mask"
+  "Feature Tracking" -> "Motion Mask"
+  "Motion Mask" -> "Motion Templating"
+  "Feature Tracking" -> "Object Tracking"
+  "Motion Templating" -> "Object Tracking"
+}
+\end{dot2tex}
+\caption{High Level Overview of Object Tracking}
+\label{overview}
+\end{figure}
+
+The general overview of the object tracking implementation can be seen in \cref{overview}. These steps will be further described and broken down to illustrate how they work using the input in \cref{fig:flow_input}. This flow is repeated for each frame to produce useful object tracking.
+
+\begin{figure}[h]
+\centering
+\captionsetup{width=0.8\textwidth}
+\includegraphics[width=0.24\textwidth]{flow_input.png}
+\caption{Input frame for flow description.}
+\label{fig:flow_input}
+\end{figure}
+
+
+\begin{description}
+\item[Building Motion Mask]
+
+The motion mask is a amalgamation of several different means of finding motion within the given video. Since many videos do not respond well to any particular type, multiplexing them together using \cref{motion_mask_eq} produces reasonable results.
+
+\begin{equation}
+\label{motion_mask_eq}
+motion\_mask = (foreground\_mask \cup tracked\_points) \cap optical\_flow
+\end{equation}
+
+\begin{figure}
+\centering
+\begin{subfigure}[t]{0.24\textwidth}
+\includegraphics[width=\textwidth]{optical_flow.png}
+\caption{Optical Flow magnitude mask after thresholding.}
+\label{fig:optical_flow}
+\end{subfigure}
+\begin{subfigure}[t]{0.24\textwidth}
+\includegraphics[width=\textwidth]{fgmask.png}
+\caption{Foreground mask found via background subtraction.}
+\label{fig:background}
+\end{subfigure}
+\begin{subfigure}[t]{0.24\textwidth}
+\includegraphics[width=\textwidth]{tracked_points.png}
+\caption{Feature Points that are moving.}
+\label{fig:tracked_points}
+\end{subfigure}
+\begin{subfigure}[t]{0.24\textwidth}
+\includegraphics[width=\textwidth]{motion_mask.png}
+\caption{Final Motion Mask}
+\label{fig:motion_mask}
+\end{subfigure}
+\caption{Building Motion Mask}
+\end{figure}
+
+\begin{description}
+\item[Optical Flow]
+
+Optical Flow is the standard OpenCV \texttt{calcOpticalFlowFarneback}. Only the magnitude is used to create a motion mask. It is also normalized and thresholded to remove extremely small motions. Shown in \cref{fig:optical_flow}
+
+\item[Background Subtraction]
+
+Background subtraction is the standard OpenCV \texttt{BackgroundSubtractorMOG2}. It is used to create a mask of all foreground objects. The background subtractor is seeded by the first 100 frames of video before the actual processing of the video is done to allow foreground detection to occur in the early frames of the video. Seen in \cref{fig:background}.
+
+\item[Feature Tracking]
+
+The image is searched for feature points using \texttt{goodFeaturesToTrack}. These points are accumulated into ``point tracks'' which give history to each point in the image. We keep up to 10 frames worth of point history. Only points which are shown to be moving are tracked. Points moving below a small threshold are discarded as point tracking over a few thousand points is an expensive operation. Shown in \cref{fig:tracked_points}.
+\end{description}
+
+The final motion mask is shown in \cref{fig:motion_mask}.
+
+\item[Motion Templating]
+
+Motion templating takes a simple motion mask which indicates where in the scene motion is observed (using \texttt{updateMotionHistory}). From this mask, the motion templates are extracted. These are simple rectangles of area in the scene where contiguous motion has been detected. This provides some level of object segmentation (using \texttt{segmentMotion}) as well as generalized motion direction (which is unreliable for the short history spans). Additionally, motion is not always continuously detected from frame to frame and cannot be directly assumed to be correct or one contiguous object. The motion templated scene can be viewed in \cref{fig:motion_template}.
+
+\begin{figure}[h]
+\centering
+\captionsetup{width=0.8\textwidth}
+\includegraphics[width=0.24\textwidth]{motion_template.png}
+\caption{Motion Template. Green boxes represent areas of motion, blue circles with arrow represent angle of motion.}
+\label{fig:motion_template}
+\end{figure}
+
+\item[Object Tracking]
+
+This is arguably the most important step of the process. Since the motion templating system does not provide perfectly detected objects or motion across frames, this information must be consumed in a way to produce a consistent representation of an object. The input to this phase is simply the segmented motion rectangles and the tracked points.
+
+\begin{description}
+\item[Motion Collection]
+We build an object for every rectangle which does not overlap with any existing rectangle and contains some moving tracked points. This allows us to not inadvertently track two distinctly separate objects.
+
+The tracked points are used to give us an idea that the object we are tracking is still the same object. If we cannot find at least 80\% of the tracked points in the next area of motion, we assume we have lost the object.
+
+If we have passed the culling threshold, we can also accumulate overlapping regions by averaging the shared area of motion. This allows the motion area to grow or shrink to match new areas of motion detection.
+\item[Motion Culling]
+If we have seen spurious or overlapping motion before we have reached a certain amount of frames of confidence of an existing moving object, we discard the motion before it is displayed to the user.
+\item[Kalman Filtering]
+After the threshold for culling has been reached, we may lose track of the object or see overlapping motion. In this case, we attempt to position the object detection at the predicted location of the object using a Kalman Filter.
+\end{description}
+
+We can see the final results of the object tracking shown in \cref{fig:flow_final}. Feature points in the image for the various tracked objects are shown in the same color as the box around the motion.
+
+\begin{figure}[h]
+\centering
+\captionsetup{width=0.8\textwidth}
+\includegraphics[width=0.24\textwidth]{result.png}
+\caption{Tracked Objects}
+\label{fig:flow_final}
+\end{figure}
+
+\end{description}
+
+\section{Results}
+The results are from the two provided samples, ``walking'' and ``subway''. These two examples illustrate both a simple and a complex scene.
+
+\subsection{Walking}
+For this example, we have two people walking and a care that moves out of frame early in the video. We track each of the people through the frame, even in the presences of occlusion by the lamp pole. This is possible due to the refreshing of feature points on the persons, as well as the kalman prediction to predict the motion even as they move behind the lightpole.
+
+\begin{figure}[h]
+\centering
+\begin{subfigure}[t]{0.24\textwidth}
+\includegraphics[width=\textwidth]{walking_0082.png}
+\caption{``Walking'' Frame 082}
+\label{fig:walk_082}
+\end{subfigure}
+\begin{subfigure}[t]{0.24\textwidth}
+\includegraphics[width=\textwidth]{walking_0164.png}
+\caption{``Walking'' Frame 164}
+\label{fig:walk_164}
+\end{subfigure}
+\begin{subfigure}[t]{0.24\textwidth}
+\includegraphics[width=\textwidth]{walking_0246.png}
+\caption{``Walking'' Frame 246}
+\label{fig:walk_246}
+\end{subfigure}
+\begin{subfigure}[t]{0.24\textwidth}
+\includegraphics[width=\textwidth]{walking_0328.png}
+\caption{``Walking'' Frame 328}
+\label{fig:walk_328}
+\end{subfigure}
+
+\caption{Walking Tracked Objects}
+\end{figure}
+
+\subsection{Subway}
+This example is much more complex and shows the frailties and strengths much better than the previous walking example. We see that not all motions are identified. This is because due to the multiple overlapping motions, the algorithm does not always have the confidence to mark a motion as valid and not part of another existing object. However, once an object is not overlapping with other objects it is tracked. Is is further able to be followed through the image when overlapping with other detected motions due to the Kalman filter allowing us to predict the new locations. 
+\begin{figure}[h]
+\centering
+\begin{subfigure}[t]{0.24\textwidth}
+\includegraphics[width=\textwidth]{subway_0035.png}
+\caption{``Subway'' Frame 035}
+\label{fig:sub_035}
+\end{subfigure}
+\begin{subfigure}[t]{0.24\textwidth}
+\includegraphics[width=\textwidth]{subway_0070.png}
+\caption{``Subway'' Frame 070}
+\label{fig:sub_070}
+\end{subfigure}
+\begin{subfigure}[t]{0.24\textwidth}
+\includegraphics[width=\textwidth]{subway_0105.png}
+\caption{``Subway'' Frame 105}
+\label{fig:sub_105}
+\end{subfigure}
+\begin{subfigure}[t]{0.24\textwidth}
+\includegraphics[width=\textwidth]{subway_0140.png}
+\caption{``Subway'' Frame 140}
+\label{fig:sub_140}
+\end{subfigure}
+
+\caption{Subway Tracked Objects}
+\end{figure}
+
+\section{Future Work}
+Due to the limited nature of the project, there are areas that could use some work. Notably the fact that objects are not always properly segmented or properly tracked in the cases of overlapping motion.
+
+Some ideas are proposed that may make a more robust motion detection and tracking algorithm.
+
+\begin{description}
+\item[Object Point Tracks] Tracked points are currently used only minimally to give confidence of object existence between frames. However, tracking their age for a given object would be a powerful piece of information for both object segmentation and tracking. If points are found to be moving apart, it can be assumed they are distinct objects and should be represented as such. 
+
+Additionally by tracking their age we know the points have belonged to an object and we could weight that against younger (more recently found) points which should not contribute as heavily to our knowledge of the objects motion.
+
+\item[Object Recognition] By implementing a face or car recognizer we could much more easily segment objects and track the movements of the objects based on that recognition. Since this project was based on motion tracking, this area was not explored.
+
+\end{description}
+
+\section{Conclusion}
+
+This project proved to be quite a challenge. Even given the relatively simple motion detection challenges, it was extremely difficult to gain good results without some heuristics and fine tuning of the algorithm (which may not be extremely general). 
+
+\end{document}
